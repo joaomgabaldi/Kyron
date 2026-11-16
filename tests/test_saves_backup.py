@@ -1,0 +1,1869 @@
+# test_saves_backup.py
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""O backup dos saves por jogo: nome no Ludusavi, tarefa, aviso de falha, a trava e a
+restauração segura (versão conferida, cópia dos saves atuais, destinos validados).
+
+O Ludusavi é um executor falso (`LudusaviFalso`); as threads de verdade rodam e o
+teste espera por todas (`esperar`) antes de olhar a tela.
+"""
+
+import json
+import logging
+import subprocess
+import sys
+import threading
+import time
+import zipfile
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from kyron import shared
+from kyron.saves import backup_de_saves, conferencia, ludusavi, pasta
+from kyron.saves.ludusavi import Versao
+from kyron.modelos import tarefas
+from tests import apoio_aplicativo
+
+_PYTHON = sys.executable  # o `ludusavi_de_verdade` troca o do `sys` durante o teste
+NAO_ACHADO = {"errors": {"unknownGames": ["x"]}, "games": {}}
+FALHOU = {"errors": {"someGamesFailed": True}, "games": {}}
+# Guardado sem compressão dentro do zip: um byte trocado nele quebra só o CRC.
+CONTEUDO = b"dados do save 0123456789"
+
+
+class LudusaviFalso:
+    """Responde como o `ludusavi.exe`, guarda o que recebeu e mede a concorrência."""
+
+    def __init__(self, pasta: Path) -> None:
+        self.pasta = pasta  # cada jogo em `<pasta>/<jogo>`, o `backupPath`; cada versão, um zip
+        self.comandos: list[list[str]] = []
+        self.achados: dict[tuple[str, str], str] = {}  # ("appid"|"titulo", valor) -> nome
+        self.versoes: dict[str, list[str]] = {}  # nome -> ids, do mais novo ao mais velho
+        # comando -> resposta no lugar da normal; a prévia é "restore --preview"
+        self.falhas: dict[str, dict] = {}
+        self.codigo_de: dict[str, int] = {}  # comando -> código de saída no lugar do 0
+        self.demora = 0.0
+        self.explode: Exception | None = None
+        self._trava = threading.Lock()
+        self.ativos = 0
+        self.max_ativos = 0
+        self.configs: dict[str, dict | None] = {}  # o config.yaml que cada comando viu por último
+        self.configs_por_chamada: list[tuple[list[str], dict | None]] = []  # na ordem
+        self.comentarios: dict[tuple[str, str], str] = {}  # (jogo, id) -> marca
+        self.previas: dict[str, dict] = {}  # jogo -> "files" da prévia
+        self.conferidos: dict[str, dict] = {}  # jogo -> "files" da saída do `backup`
+        self.registros: dict[str, dict] = {}  # jogo -> "registry" da prévia
+        self.cria_versao: dict[str, bool] = {}  # jogo -> o `backup` cria uma versão nova
+        self.no_zip: dict[str, list[str]] = {}  # id -> nomes dentro do zip da versão
+        self.baixa_manifesto = False  # o `manifest update` grava o manifest.yaml (há rede)
+        self._agora = datetime.now(timezone.utc)
+        self._quando: dict[tuple[str, str], datetime] = {}  # as criadas pelo `backup`
+        self._zipadas: set[tuple[str, str]] = set()
+
+    def __call__(self, args, **kwargs):
+        # O `backups edit` não leva `--api`; os outros, sempre no fim.
+        fim = -1 if args[-1] == "--api" else len(args)
+        comando = args[args.index("--try-manifest-update") + 1 : fim]
+        pasta_config = Path(args[args.index("--config") + 1])
+        with self._trava:
+            self.comandos.append(comando)
+            self.ativos += 1
+            self.max_ativos = max(self.max_ativos, self.ativos)
+        try:
+            if self.explode is not None:
+                raise self.explode
+            arquivo = pasta_config / "config.yaml"
+            visto = json.loads(arquivo.read_text("utf-8")) if arquivo.is_file() else None
+            self.configs[comando[0]] = visto
+            self.configs_por_chamada.append((comando, visto))
+            time.sleep(self.demora)
+            if comando[:2] == ["manifest", "update"]:
+                if self.baixa_manifesto:
+                    (pasta_config / "manifest.yaml").write_text("{}", "utf-8")
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return self._responder(args, comando)
+        finally:
+            with self._trava:
+                self.ativos -= 1
+
+    def _responder(self, args, comando):
+        nome = comando[0]
+        if nome == "backup" and self.cria_versao.get(comando[1]):
+            # Antes da falha: com um arquivo travado, o Ludusavi cria a versão mesmo assim.
+            nova = f"nova{len(self._quando) + 1}"
+            self.versoes.setdefault(comando[1], []).insert(0, nova)
+            self._quando[(comando[1], nova)] = datetime.now(timezone.utc)
+        if comando[:2] == ["backups", "edit"]:
+            self.comentarios[(comando[2], comando[4])] = comando[6]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "--preview" in comando and "restore --preview" in self.falhas:
+            saida = self.falhas["restore --preview"]
+            codigo = self.codigo_de.get("restore --preview", 0)
+        elif "--preview" in comando:
+            jogo = comando[1]
+            arquivos = self.previas.get(jogo, {})
+            saida = {"games": {jogo: {"files": arquivos, "registry": self.registros.get(jogo, {})}}}
+            codigo = 0
+        elif nome in self.falhas:
+            saida, codigo = self.falhas[nome], self.codigo_de.get(nome, 0)
+        elif nome == "find":
+            chave = ("appid", comando[2]) if comando[1] == "--steam-id" else ("titulo", comando[1])
+            achado = self.achados.get(chave)
+            saida = {"games": {achado: {"score": 1.0}}} if achado else NAO_ACHADO
+            codigo = 0 if achado else 1
+        elif nome == "backups":
+            saida = {"games": {jogo: self._jogo(jogo, ids) for jogo, ids in self.versoes.items()}}
+            codigo = 0
+        elif nome == "backup" and comando[1] in self.conferidos:
+            saida, codigo = {"games": {comando[1]: {"files": self.conferidos[comando[1]]}}}, 0
+        else:
+            saida, codigo = {"games": {}}, 0
+        return subprocess.CompletedProcess(args, codigo, json.dumps(saida), "")
+
+    def _jogo(self, jogo: str, ids: list[str]) -> dict:
+        pasta = self.pasta / jogo
+        pasta.mkdir(parents=True, exist_ok=True)
+        copias = []
+        for i, id_ in enumerate(ids):
+            # Uma vez só, quando a versão aparece: o teste pode estragar ou apagar o zip depois.
+            if (jogo, id_) not in self._zipadas:
+                self._zipadas.add((jogo, id_))
+                with zipfile.ZipFile(pasta / id_, "w") as zip_:
+                    for dentro in self.no_zip.get(id_, ["drive-C/Jogos/save.sav"]):
+                        zip_.writestr(dentro, CONTEUDO)
+            # Relativo a agora: a versão que já existia é sempre mais velha que a cópia.
+            quando = self._quando.get((jogo, id_), self._agora - timedelta(days=i + 1))
+            copias.append(
+                {"name": id_, "when": quando.isoformat(), "comment": self.comentarios.get((jogo, id_), "")}
+            )
+        return {"backupPath": str(pasta), "backups": copias}
+
+    def chamou(self, comando: str) -> list[list[str]]:
+        return [c for c in self.comandos if c[0] == comando]
+
+    def restauracoes(self) -> list[list[str]]:
+        """Os `restore` de verdade, sem as prévias."""
+        return [c for c in self.chamou("restore") if "--preview" not in c]
+
+    def marcas(self) -> list[list[str]]:
+        return [c for c in self.chamou("backups") if c[1:2] == ["edit"]]
+
+
+def _com_manifesto(tmp_path) -> None:
+    """O manifesto que o Ludusavi baixa para a pasta de configuração dele."""
+    (tmp_path / "ludusavi").mkdir(exist_ok=True)
+    (tmp_path / "ludusavi" / "manifest.yaml").write_text("{}", "utf-8")
+
+
+@pytest.fixture(autouse=True)
+def ambiente(tmp_path, monkeypatch, ludusavi_de_verdade):
+    """Um `ludusavi.exe` (de mentira) ao lado do Python, GSettings de verdade (a pasta
+    dos saves lê dele) e o cache em memória zerado."""
+    (tmp_path / "ludusavi.exe").touch()
+    _com_manifesto(tmp_path)  # o normal depois da primeira busca; quem testa a falta o apaga
+    monkeypatch.setattr(backup_de_saves, "_cache", {})
+    monkeypatch.setattr(backup_de_saves, "_restaurando", Counter())
+    monkeypatch.setattr(backup_de_saves, "_jogos_restaurando", Counter())
+    monkeypatch.setattr(backup_de_saves, "_restaurando_todos", 0)
+    monkeypatch.setattr(backup_de_saves, "_tarefas_abertas", 0)
+    monkeypatch.setattr(backup_de_saves, "_manifesto_falhou_em", None)
+    _esvaziar_tarefas()
+    yield
+    _esvaziar_tarefas()
+
+
+def _esvaziar_tarefas() -> None:
+    """A lista de tarefas é do módulo: o que sobra de um teste não passa ao seguinte."""
+    for tarefa in list(tarefas.lista._tarefas):  # pylint: disable=protected-access
+        tarefas.lista.remover(tarefa)
+
+
+@pytest.fixture(autouse=True)
+def aplicativo(monkeypatch) -> apoio_aplicativo.AplicativoAnotado:
+    """O app que o módulo avisa: os avisos, os diálogos e as perguntas ficam anotados nele."""
+    monkeypatch.setattr(backup_de_saves, "_local_desconhecido_na_tela", set())
+    return apoio_aplicativo.instalar(monkeypatch)
+
+
+@pytest.fixture
+def dialogos(aplicativo) -> list[tuple[str, str]]:
+    """Os diálogos de um botão que o módulo pediu: [(título, texto)]."""
+    return aplicativo.dialogos
+
+
+def perguntas() -> list[tuple[str, str, str]]:
+    """As perguntas de dois botões que o módulo pediu: [(título, texto, rótulo de confirmar)]."""
+    return [(c["titulo"], c["corpo"], c["rotulo"]) for c in shared.aplicativo.confirmacoes]
+
+
+NADA_PARA_RESTAURAR = ("Nada para restaurar", "Nenhum jogo tem cópias dos saves para restaurar.")
+
+
+def incompleta(corpo: str) -> tuple[str, str]:
+    """O diálogo do fim de "Restaurar todos" com falhas."""
+    return ("Restauração incompleta", corpo)
+
+
+def incompleta_de(*jogos: str) -> tuple[str, str]:
+    """O mesmo, com várias falhas: os nomes dos jogos, "A, B e C"."""
+    juntos = ", ".join(jogos[:-1]) + " e " + jogos[-1]
+    return incompleta(f"Não foi possível restaurar os saves dos seguintes jogos: {juntos}.")
+
+
+# O aviso de falha de cada pedido, com o jogo "Meu Jogo".
+AVISO_DO_PEDIDO = {
+    "backup": "Não foi possível fazer o backup dos saves de Meu Jogo.",
+    "um": "Não foi possível restaurar o save de Meu Jogo.",
+    "todos": "Não foi possível restaurar os saves.",
+}
+
+
+def pedir(pedido: str, jogo) -> None:
+    if pedido == "backup":
+        backup_de_saves.no_fim_da_sessao(jogo)
+    elif pedido == "um":
+        backup_de_saves.restaurar(jogo, "v1")
+    else:
+        backup_de_saves.restaurar_todos()
+
+
+@pytest.fixture
+def falso(monkeypatch, tmp_path):
+    falso = LudusaviFalso(tmp_path / "zips")
+    monkeypatch.setattr(backup_de_saves, "executor", falso)
+    return falso
+
+
+@pytest.fixture
+def esperar(monkeypatch, flush_idle):
+    """Registra cada thread que o módulo cria; chamar espera todas e esvazia a fila da tela."""
+    criadas: list[threading.Thread] = []
+    original = threading.Thread
+
+    class Registrada(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            criadas.append(self)
+
+    monkeypatch.setattr(backup_de_saves.threading, "Thread", Registrada)
+
+    def aguardar():
+        for thread in criadas:
+            thread.join(10)
+            assert not thread.is_alive()
+        flush_idle()
+
+    yield aguardar
+    # Também quando o teste falha antes de chamar `aguardar`: a thread não pode sobreviver
+    # ao teste, porque acordaria com o executor falso, o `tmp_path` e o `sys.executable` já desfeitos.
+    for thread in criadas:
+        thread.join(10)
+
+
+def toasts() -> list[str]:
+    """Os avisos (texto puro, sempre) que o módulo deu."""
+    return shared.aplicativo.avisos.textos
+
+
+def titulos() -> list[str]:
+    return toasts()
+
+
+def na_biblioteca(store, make_game, **campos):
+    jogo = make_game(**campos)
+    store.add_game(jogo, {})
+    return jogo
+
+
+def test_resolve_por_appid_e_guarda(store, make_game, falso, esperar, tmp_path):
+    falso.achados[("appid", "3669870")] = "Nome do Manifesto"
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="3669870")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert jogo.ludusavi_nome == "Nome do Manifesto"
+    assert jogo.saves == 1  # gravado pelo caminho normal de salvar
+    assert falso.chamou("backup") == [["backup", "Nome do Manifesto", "--force"]]
+    entrada = falso.configs["backup"]["customGames"][0]
+    assert (entrada["name"], entrada["integration"]) == ("Nome do Manifesto", "extend")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert len(falso.chamou("find")) == 1  # a segunda sessão não procura de novo
+    assert len(falso.chamou("backup")) == 2
+
+
+def test_sem_appid_nao_procura_pelo_titulo(store, make_game, falso, esperar, tmp_path, dialogos):
+    falso.achados[("titulo", "Alien: Isolation")] = "Alien: Isolation"
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Alien: Isolation")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("find") == []
+    assert falso.chamou("backup") == []
+    assert jogo.ludusavi_nome == ""
+    assert perguntas() == [_aviso_sem_backup("Alien: Isolation")]
+
+
+def test_backup_desligado_nao_procura_nao_copia_e_nao_avisa(
+    store, make_game, falso, esperar, dialogos, caplog
+):
+    falso.achados[("appid", "3669870")] = "Nome do Manifesto"
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="3669870", backup_dos_saves_desligado=True
+    )
+
+    with caplog.at_level("INFO"):
+        backup_de_saves.no_fim_da_sessao(jogo)
+        esperar()
+
+    assert falso.chamou("find") == []
+    assert falso.chamou("backup") == []
+    assert jogo.ludusavi_nome == ""
+    assert list(dialogos) == []
+    assert perguntas() == []
+    assert toasts() == []
+    assert "desligado" in caplog.text
+
+
+def _sem_manifesto(tmp_path) -> None:
+    (tmp_path / "ludusavi" / "manifest.yaml").unlink()
+
+
+def test_appid_fora_do_manifesto_fica_sem_backup_e_avisa(
+    store, make_game, falso, esperar, tmp_path, dialogos
+):
+    _com_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo Raro", steam_appid="42")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert [c[:2] for c in falso.chamou("find")] == [["find", "--steam-id"]]
+    assert falso.chamou("backup") == []
+    assert jogo.ludusavi_nome == ""  # sem entrada própria
+    assert toasts() == []
+    assert perguntas() == [_aviso_sem_backup("Jogo Raro")]
+
+
+def test_sem_manifesto_nao_guarda_o_nome(store, make_game, falso, esperar, tmp_path):
+    _sem_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo Raro", steam_appid="42")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("find") == []  # sem manifesto o `find` não diria nada
+    assert jogo.ludusavi_nome == ""  # a próxima sessão procura de novo
+    assert falso.chamou("backup") == []
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Jogo Raro."]
+    assert tarefas.lista.rowCount() == 0
+
+
+def _aviso_sem_backup(nome: str) -> tuple[str, str, str]:
+    return (
+        "Saves sem backup",
+        f"Não foi possível identificar os saves de {nome}. Indique o jogo nas opções avançadas "
+        "para que o backup seja feito.",
+        "Editar jogo",
+    )
+
+
+LOCAL_DESCONHECIDO = _aviso_sem_backup("Tom & <b>Jerry</b>")
+
+
+def test_local_desconhecido_avisa_num_dialogo(
+    store, make_game, falso, esperar, monkeypatch, tmp_path, dialogos
+):
+    _com_manifesto(tmp_path)  # "fora do manifesto" pressupõe que há um manifesto
+    vistas = []
+    comecar = tarefas.comecar
+    monkeypatch.setattr(tarefas, "comecar", lambda nome, total: vistas.append((nome, total)) or comecar(nome, total))
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Tom & <b>Jerry</b>")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    # A tarefa nasce no pedido, antes da busca do nome, e some quando não há o que copiar.
+    assert vistas == [("Backup dos saves de Tom & <b>Jerry</b>", 1)]
+    assert falso.chamou("backup") == []
+    assert jogo.ludusavi_nome == ""
+    # Diálogo, e não aviso: o jogo fica sem backup até ser identificado.
+    assert toasts() == []
+    assert perguntas() == [LOCAL_DESCONHECIDO]
+    # A marca espera a resposta: fechado o app antes, o diálogo volta na próxima sessão.
+    assert jogo.saves_local_desconhecido_avisado is False
+    assert jogo.saves == 0
+    assert tarefas.lista.rowCount() == 0
+
+    shared.aplicativo.responder(0, False)
+
+    assert jogo.saves_local_desconhecido_avisado is True
+    assert jogo.saves == 1  # o campo foi gravado pelo caminho normal de salvar
+
+
+def test_local_desconhecido_sem_resposta_avisa_de_novo(store, make_game, falso, esperar, tmp_path, dialogos):
+    _com_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Tom & <b>Jerry</b>")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+    # Outra sessão termina com o diálogo ainda na tela: não abre um segundo.
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+    assert len(perguntas()) == 1
+
+    # O app fechou sem resposta: na próxima vez (outro objeto, lido do disco) o diálogo volta.
+    backup_de_saves._local_desconhecido_na_tela.clear()  # pylint: disable=protected-access
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+    assert perguntas() == [LOCAL_DESCONHECIDO, LOCAL_DESCONHECIDO]
+
+
+class EdicaoFalsa:
+    """O `ModeloDaEdicao` que o módulo alcança por `shared.edicao`: anota `(game_id, avancadas)`."""
+
+    def __init__(self, aberto: bool = False) -> None:
+        self.aberto = aberto
+        self.aberturas: list[tuple[str, bool]] = []
+
+    def abrir(self, game_id: str, avancadas: bool = False) -> None:
+        self.aberturas.append((game_id, avancadas))
+
+
+def _sem_local(store, make_game, falso, esperar, tmp_path):
+    _com_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Tom & <b>Jerry</b>")
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+    return jogo
+
+
+def test_saves_sem_backup_editar_abre_as_avancadas(store, make_game, falso, esperar, monkeypatch, tmp_path):
+    edicao = EdicaoFalsa()
+    monkeypatch.setattr(shared, "edicao", edicao, raising=False)
+    jogo = _sem_local(store, make_game, falso, esperar, tmp_path)
+
+    shared.aplicativo.responder(0, True)
+
+    assert edicao.aberturas == [("a", True)]
+    assert jogo.saves_local_desconhecido_avisado is True
+
+
+def test_saves_sem_backup_dispensar_grava_a_marca_e_nao_abre(store, make_game, falso, esperar, monkeypatch, tmp_path):
+    edicao = EdicaoFalsa()
+    monkeypatch.setattr(shared, "edicao", edicao, raising=False)
+    jogo = _sem_local(store, make_game, falso, esperar, tmp_path)
+
+    shared.aplicativo.responder(0, False)
+
+    assert edicao.aberturas == []
+    assert jogo.saves_local_desconhecido_avisado is True
+    assert jogo.saves == 1  # a marca foi gravada pelo caminho normal de salvar
+
+
+def test_saves_sem_backup_com_o_editor_aberto_nao_abre_outro(store, make_game, falso, esperar, monkeypatch, tmp_path):
+    edicao = EdicaoFalsa(aberto=True)
+    monkeypatch.setattr(shared, "edicao", edicao, raising=False)
+    jogo = _sem_local(store, make_game, falso, esperar, tmp_path)
+
+    shared.aplicativo.responder(0, True)
+
+    assert edicao.aberturas == []
+    assert jogo.saves_local_desconhecido_avisado is True
+
+
+def test_backup_de_saves_sem_gi():
+    raiz = Path(__file__).resolve().parent.parent
+    codigo = (
+        f"import builtins, sys; builtins._ = lambda m: m; sys.path.insert(0, {str(raiz)!r}); from kyron.saves import backup_de_saves; "
+        "assert 'gi' not in sys.modules, sorted(m for m in sys.modules if m.startswith('gi'))"
+    )
+    resultado = subprocess.run(
+        [_PYTHON, "-I", "-c", codigo],
+        cwd=raiz,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert resultado.returncode == 0, resultado.stderr
+
+
+def test_aviso_de_thread_chega_pela_fila_do_app(flush_idle):
+    thread = threading.Thread(target=backup_de_saves._avisar, args=("Aviso de fora",))  # pylint: disable=protected-access
+    thread.start()
+    thread.join(10)
+
+    assert toasts() == []  # só a thread principal fala com a tela
+    flush_idle()
+    assert toasts() == ["Aviso de fora"]
+
+
+def test_local_desconhecido_so_registra_depois(store, make_game, falso, esperar, tmp_path, caplog, dialogos):
+    _com_manifesto(tmp_path)
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Jogo Sem Nada", saves_local_desconhecido_avisado=True
+    )
+
+    with caplog.at_level(logging.INFO):  # o arquivo de log do app grava a partir do DEBUG
+        backup_de_saves.no_fim_da_sessao(jogo)
+        esperar()
+
+    assert toasts() == []
+    assert dialogos == []
+    assert perguntas() == []
+    assert falso.chamou("backup") == []
+    assert jogo.saves == 0  # nada novo a gravar
+    assert [r.getMessage() for r in caplog.records if "Jogo Sem Nada" in r.getMessage()] == [
+        "O local dos saves de Jogo Sem Nada é desconhecido: sem backup"
+    ]
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_sem_appid_sem_manifesto_avisa(store, make_game, falso, esperar, tmp_path):
+    _sem_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo Sem Nada")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("find") == []
+    assert falso.chamou("backup") == []
+    assert jogo.ludusavi_nome == ""  # a próxima sessão procura de novo
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Jogo Sem Nada."]
+    # Sem o manifesto "não achado" não quer dizer nada: o campo do aviso fica como estava.
+    assert jogo.saves_local_desconhecido_avisado is False
+    assert jogo.saves == 0
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_sem_manifesto_nao_faz_backup_de_jogo_com_nome(store, make_game, falso, esperar, tmp_path):
+    # Sem o manifesto o Ludusavi copia só os caminhos do config e sai com 0: a versão
+    # ficaria sem o save que o manifesto aponta, e sem marca de incompleta.
+    _sem_manifesto(tmp_path)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("backup") == []
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Meu Jogo."]
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_falha_vira_toast(store, make_game, falso, esperar):
+    falso.falhas["backup"] = {"errors": {"someGamesFailed": True}, "games": {}}
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Tom & <b>Jerry</b>", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert len(toasts()) == 1
+    assert toasts()[0] == "Não foi possível fazer o backup dos saves de Tom & <b>Jerry</b>."
+
+
+def test_backup_que_falha_marca_a_versao_nova(store, make_game, falso, esperar):
+    falso.falhas["backup"] = FALHOU
+    falso.versoes["X"] = ["v1"]
+    falso.cria_versao["X"] = True  # o arquivo travado deixa a versão pela metade
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.marcas() == [
+        ["backups", "edit", "X", "--backup", "nova1", "--comment", "cartridges:incompleta"]
+    ]
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Meu Jogo."]
+
+
+def test_backup_que_falha_relê_o_cache(store, make_game, falso, esperar):
+    falso.falhas["backup"] = FALHOU
+    falso.versoes["X"] = ["v1"]
+    falso.cria_versao["X"] = True
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    # O diálogo de versões vê a versão incompleta, já marcada, sem esperar outra leitura.
+    versoes = backup_de_saves.versoes_do_jogo(jogo)
+    assert [v.id for v in versoes] == ["nova1", "v1"]
+    assert versoes[0].comentario == "cartridges:incompleta"
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Meu Jogo."]
+
+
+def test_backup_que_falha_sem_versao_nova_nao_marca(store, make_game, falso, esperar):
+    falso.falhas["backup"] = FALHOU
+    falso.versoes["X"] = ["v1"]  # a boa de antes: nunca leva a marca
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.marcas() == []
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Meu Jogo."]
+
+
+def test_falha_antes_do_backup_nao_marca(store, make_game, falso, esperar, tmp_path):
+    # Sem a pasta dos saves o Ludusavi nem é chamado: não há versão nova a marcar.
+    shared.schema.set_string("pasta-dos-saves", str(tmp_path / "disco-desconectado" / "saves"))
+    falso.versoes["X"] = ["v1"]
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.marcas() == []
+    assert falso.chamou("backups") == []
+    assert len(toasts()) == 1
+
+
+def test_pasta_sumiu_vira_toast(store, make_game, falso, esperar, tmp_path):
+    shared.schema.set_string("pasta-dos-saves", str(tmp_path / "disco-desconectado" / "saves"))
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("backup") == []  # não recria a pasta em outro lugar com o histórico perdido
+    assert toasts() == ["Não foi possível fazer o backup dos saves de Jogo."]
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_ludusavi_que_explode_vira_toast(store, make_game, falso, esperar):
+    falso.explode = OSError("sem permissão")
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert len(toasts()) == 1
+
+
+def test_sessoes_em_sequencia_nao_se_cruzam(store, make_game, falso, esperar, tmp_path):
+    falso.demora = 0.05
+    primeiro = na_biblioteca(store, make_game, game_id="a", name="A", steam_appid="1", ludusavi_nome="A")
+    segundo = na_biblioteca(store, make_game, game_id="b", name="B", steam_appid="2", ludusavi_nome="B")
+
+    backup_de_saves.no_fim_da_sessao(primeiro)
+    backup_de_saves.no_fim_da_sessao(segundo)
+    esperar()
+
+    assert len(falso.chamou("backup")) == 2
+    assert falso.max_ativos == 1
+    assert toasts() == []
+
+
+def test_tarefa_aparece_e_some(store, make_game, falso, esperar, monkeypatch):
+    vistas = []
+    comecar = tarefas.comecar
+    monkeypatch.setattr(tarefas, "comecar", lambda nome, total: vistas.append((nome, total)) or comecar(nome, total))
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert vistas == [("Backup dos saves de Meu Jogo", 1)]
+    assert tarefas.lista.rowCount() == 0
+
+
+def _espiar_em_andamento(monkeypatch, falso):
+    """Anota o que `em_andamento()` diz em cada comando do Ludusavi: [(comando, bool)]."""
+    vistos = []
+
+    def espia(args, **kwargs):
+        comando = args[args.index("--try-manifest-update") + 1]
+        vistos.append((comando, backup_de_saves.em_andamento()))
+        return falso(args, **kwargs)
+
+    monkeypatch.setattr(backup_de_saves, "executor", espia)
+    return vistos
+
+
+def test_em_andamento_do_pedido_ao_fim(store, make_game, falso, esperar, monkeypatch, tmp_path):
+    _com_manifesto(tmp_path)
+    vistos = _espiar_em_andamento(monkeypatch, falso)
+    sem_nada = na_biblioteca(store, make_game, game_id="s", name="Jogo Sem Nada", steam_appid="9")
+    com_saves = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+    assert backup_de_saves.em_andamento() is False
+
+    backup_de_saves.no_fim_da_sessao(sem_nada)
+    esperar()
+    # A busca do nome já conta: fechar o app nela perderia o backup sem aviso.
+    assert vistos == [("find", True)]
+    assert backup_de_saves.em_andamento() is False
+
+    vistos.clear()
+    backup_de_saves.no_fim_da_sessao(com_saves)
+    esperar()
+    assert vistos == [("backup", True), ("backups", True)]
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_em_andamento_desce_quando_o_backup_falha(store, make_game, falso, esperar, monkeypatch):
+    falso.falhas["backup"] = FALHOU
+    vistos = _espiar_em_andamento(monkeypatch, falso)
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert ("backup", True) in vistos
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_tarefa_que_nao_abre_nao_deixa_a_contagem_subir(store, make_game, falso, esperar, monkeypatch):
+    """`tarefas.comecar` que levanta: a contagem sobe antes dele e tem de voltar."""
+
+    def nao_abre(_nome, _total):
+        raise RuntimeError("sem tela")
+
+    monkeypatch.setattr(tarefas, "comecar", nao_abre)
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.no_fim_da_sessao(jogo)  # não levanta: quem pede é a tela
+    esperar()
+
+    assert falso.comandos == []  # o backup nem começou
+    assert titulos() == ["Não foi possível fazer o backup dos saves de Meu Jogo."]
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_em_andamento_na_restauracao_de_um_jogo(store, make_game, falso, esperar, monkeypatch):
+    falso.versoes["X"] = ["v1"]
+    vistos = _espiar_em_andamento(monkeypatch, falso)
+    jogo = na_biblioteca(
+        store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X"
+    )
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert ("restore", True) in vistos
+    assert all(visto for _comando, visto in vistos)  # a leitura das versões já é da tarefa
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_em_andamento_em_restaurar_todos(store, make_game, falso, esperar, monkeypatch):
+    falso.versoes = {"A": ["v1"]}
+    vistos = _espiar_em_andamento(monkeypatch, falso)
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    # Tudo com a tarefa à vista, até a primeira leitura das versões (que diz o que restaurar).
+    assert vistos[0] == ("backups", True)
+    assert ("restore", True) in vistos
+    assert all(visto for _comando, visto in vistos)
+    assert backup_de_saves.em_andamento() is False
+
+
+def _nomes_das_tarefas() -> list[str]:
+    return [tarefas.lista.index(i).data(tarefas.ListaDeTarefas.NOME) for i in range(tarefas.lista.rowCount())]
+
+
+def test_fim_de_sessao_ja_conta_durante_a_busca_do_nome(
+    store, make_game, falso, esperar, flush_idle, monkeypatch
+):
+    """O `find` pode levar segundos: fechar o app nele perderia o backup sem aviso."""
+    falso.achados[("appid", "7")] = "X"
+    na_busca, seguir = threading.Event(), threading.Event()
+    vistos = []
+
+    def espia(args, **kwargs):
+        if args[args.index("--try-manifest-update") + 1] == "find":
+            vistos.append(backup_de_saves.em_andamento())
+            na_busca.set()
+            seguir.wait(10)
+        return falso(args, **kwargs)
+
+    monkeypatch.setattr(backup_de_saves, "executor", espia)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    try:
+        assert na_busca.wait(10)
+        flush_idle()
+        assert _nomes_das_tarefas() == ["Backup dos saves de Meu Jogo"]
+    finally:
+        seguir.set()
+    esperar()
+
+    assert vistos == [True]
+    assert falso.chamou("backup") == [["backup", "X", "--force"]]
+    assert tarefas.lista.rowCount() == 0
+    assert backup_de_saves.em_andamento() is False
+
+
+@pytest.mark.parametrize("pedido", ["um", "todos"])
+def test_restauracao_na_fila_ja_conta(store, make_game, falso, esperar, flush_idle, pedido):
+    falso.versoes["X"] = ["v1"]
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    # Um backup lento segura a trava (o do app, por exemplo, que não tem tarefa dos saves).
+    with backup_de_saves.trava_dos_saves():
+        if pedido == "um":
+            backup_de_saves.restaurar(jogo, "v1")
+        else:
+            backup_de_saves.restaurar_todos()
+        flush_idle()
+        # A restauração ainda espera a trava, mas fechar o app agora a perderia.
+        assert backup_de_saves.em_andamento() is True
+        assert _nomes_das_tarefas() == [
+            "Restaurando o save de Meu Jogo" if pedido == "um" else "Restaurando os saves"
+        ]
+    esperar()
+
+    assert len(falso.restauracoes()) == 1
+    assert tarefas.lista.rowCount() == 0
+    assert backup_de_saves.em_andamento() is False
+
+
+@pytest.mark.parametrize("pedido", ["backup", "um", "todos"])
+def test_falha_ao_abrir_a_thread_desfaz_a_tarefa(store, make_game, falso, flush_idle, monkeypatch, pedido):
+    def nao_abre(*_args):
+        raise RuntimeError("não abriu")
+
+    vistas = []
+    comecar = tarefas.comecar
+    monkeypatch.setattr(tarefas, "comecar", lambda nome, total: vistas.append(nome) or comecar(nome, total))
+    monkeypatch.setattr(backup_de_saves, "_em_segundo_plano", nao_abre)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    pedir(pedido, jogo)  # não levanta: quem pede é a tela
+    flush_idle()
+
+    assert len(vistas) == 1  # a tarefa nasceu no pedido...
+    assert tarefas.lista.rowCount() == 0  # ...e saiu com a falha
+    assert titulos() == [AVISO_DO_PEDIDO[pedido]]
+    assert backup_de_saves.em_andamento() is False
+
+
+@pytest.fixture
+def totais(monkeypatch) -> list[int]:
+    """Cada total que uma tarefa mostrou na lista: ao entrar e a cada atualização (a saída
+    vem sempre depois, na mesma fila da tela)."""
+    vistos: list[int] = []
+    adicionar, atualizar = tarefas.lista.adicionar, tarefas.Tarefa._atualizar
+
+    def ao_adicionar(tarefa):
+        vistos.append(tarefa.total)
+        return adicionar(tarefa)
+
+    def ao_atualizar(tarefa, feitos, total):
+        resultado = atualizar(tarefa, feitos, total)
+        vistos.append(tarefa.total)
+        return resultado
+
+    monkeypatch.setattr(tarefas.lista, "adicionar", ao_adicionar)
+    monkeypatch.setattr(tarefas.Tarefa, "_atualizar", ao_atualizar)
+    return vistos
+
+
+def test_restaurar_todos_sem_jogo_com_nome_avisa_que_nada_ha(
+    store, make_game, falso, esperar, dialogos, totais
+):
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1")  # sem nome
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert list(dialogos) == [NADA_PARA_RESTAURAR]
+    assert totais == []  # nenhuma tarefa entrou na lista
+    assert falso.comandos == []  # nem thread
+    assert toasts() == []
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_restaurar_todos_sem_backup_avisa_que_nada_ha(store, make_game, falso, esperar, dialogos, totais):
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert list(dialogos) == [NADA_PARA_RESTAURAR]
+    assert falso.restauracoes() == []
+    assert toasts() == []
+    assert totais and 0 not in totais  # a tarefa existiu durante a leitura, nunca "0 de 0"
+    assert tarefas.lista.rowCount() == 0
+    assert backup_de_saves.em_andamento() is False
+
+
+def test_restaurar_todos_nunca_mostra_total_zero(store, make_game, falso, esperar, dialogos, totais):
+    falso.versoes = {"A": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert totais[0] == 2  # os jogos com nome, enquanto não se sabe quem tem backup
+    assert totais[-1] == 1
+    assert 0 not in totais
+    assert dialogos == []
+
+
+def test_restaurar_todos_total_provisorio_conta_o_nome_uma_vez(
+    store, make_game, falso, esperar, totais
+):
+    falso.versoes = {"A": ["v1"]}
+    # O mesmo jogo em duas lojas: um nome só no Ludusavi, uma restauração só.
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert totais[0] == 1
+
+
+def test_restaurar_todos_total_provisorio_so_conta_quem_tem_backup(
+    store, make_game, falso, esperar, monkeypatch, totais
+):
+    falso.versoes = {"A": ["v1"]}
+    monkeypatch.setattr(
+        backup_de_saves, "_cache", {"A": [Versao("v1", datetime.now(timezone.utc))]}
+    )
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert totais[0] == 1  # o B não tem cópias no cache
+
+
+def test_sem_executavel_nada_roda(store, make_game, falso, esperar, tmp_path):
+    (tmp_path / "ludusavi.exe").unlink()
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X")
+
+    assert backup_de_saves.disponivel() is False
+    backup_de_saves.no_fim_da_sessao(jogo)
+    backup_de_saves.atualizar_cache()
+    backup_de_saves.restaurar(jogo, "v1")
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert falso.comandos == []
+    assert toasts() == []
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_o_config_leva_todos_os_jogos_com_nome(store, make_game, falso, esperar, tmp_path):
+    na_biblioteca(store, make_game, game_id="a", name="A", steam_appid="1", ludusavi_nome="Nome A")
+    na_biblioteca(store, make_game, game_id="r", name="R", steam_appid="2", ludusavi_nome="Nome R", removed=True)
+    na_biblioteca(store, make_game, game_id="s", name="S", steam_appid="3")  # ainda sem nome
+    atual = na_biblioteca(store, make_game, game_id="c", name="C", steam_appid="4", ludusavi_nome="Nome C")
+
+    backup_de_saves.no_fim_da_sessao(atual)
+    esperar()
+
+    nomes = {jogo["name"] for jogo in falso.configs["backup"]["customGames"]}
+    assert nomes == {"Nome A", "Nome C"}  # o removido e o sem nome ficam de fora
+
+
+def test_backup_atualiza_o_cache(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["novo", "velho"]
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X")
+    assert backup_de_saves.tem_backup(jogo) is False
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert backup_de_saves.tem_backup(jogo) is True
+    assert [v.id for v in backup_de_saves.versoes_do_jogo(jogo)] == ["novo", "velho"]
+    assert isinstance(backup_de_saves.versoes_do_jogo(jogo)[0], Versao)
+
+
+def test_atualizar_cache_grava_o_config_antes(store, make_game, falso, esperar, tmp_path):
+    """Sem o config.yaml o Ludusavi leria a pasta de backup padrão dele, não a nossa."""
+    falso.versoes["X"] = ["v1"]
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.atualizar_cache()
+    esperar()
+
+    assert falso.configs["backups"] is not None
+    assert falso.configs["backups"]["backup"]["path"] == str(tmp_path / "saves")
+    assert backup_de_saves.tem_backup(jogo) is True
+
+
+def test_restaurar_uma_versao(store, make_game, falso, esperar, monkeypatch):
+    vistas = []
+    comecar = tarefas.comecar
+    monkeypatch.setattr(tarefas, "comecar", lambda nome, total: vistas.append((nome, total)) or comecar(nome, total))
+    falso.versoes["X"] = ["novo", "velho"]
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "velho")
+    esperar()
+
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "velho"]]
+    assert vistas == [("Restaurando o save de Meu Jogo", 1)]
+    assert toasts() == []
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_restaurar_falha_vira_toast(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["v1"]
+    falso.falhas["restore"] = FALHOU  # só o `restore` de verdade: a prévia passa
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert len(falso.restauracoes()) == 1
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+
+
+def test_restaurar_todos_so_os_da_biblioteca(store, make_game, falso, esperar, monkeypatch):
+    criadas = []
+    comecar = tarefas.comecar
+    monkeypatch.setattr(tarefas, "comecar", lambda nome, total: criadas.append(comecar(nome, total)) or criadas[-1])
+    falso.versoes = {"A": ["v1"], "Z": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="B", steam_appid="2", ludusavi_nome="B")  # sem backup
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert falso.restauracoes() == [["restore", "A", "--force", "--backup", "v1"]]
+    # Nasce no pedido com os dois jogos com nome; o total vira 1 quando se sabe quem tem backup.
+    assert [(t.nome, t.total) for t in criadas] == [("Restaurando os saves", 1)]
+    assert toasts() == []
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_restaurar_todos_sem_conseguir_ler_os_backups_avisa_uma_vez(store, make_game, falso, esperar):
+    falso.falhas["backups"] = {}  # saída vazia: o Ludusavi não devolveu nada útil
+    falso.codigo_de["backups"] = 1
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert falso.chamou("restore") == []
+    assert toasts() == ["Não foi possível restaurar os saves."]
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_restaurar_todos_relê_o_cache_no_fim(store, make_game, falso, esperar):
+    falso.versoes = {"A": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert falso.comandos[0] == ["backups"]  # antes
+    assert falso.comandos[-1] == ["backups"]  # e depois
+
+
+def test_restaurar_todos_segue_depois_de_uma_falha_e_avisa_uma_vez(
+    store, make_game, falso, esperar, dialogos
+):
+    falso.versoes = {"A": ["v1"], "B": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+    falso.falhas["restore"] = FALHOU
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert len(falso.restauracoes()) == 2
+    assert list(dialogos) == [incompleta_de("Jogo A", "Jogo B")]
+    assert toasts() == []
+
+
+def test_restaurando_durante_e_depois(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["v1"]
+    falso.demora = 0.2
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+    outro = na_biblioteca(store, make_game, game_id="b", name="Outro", steam_appid="8", ludusavi_nome="Y")
+
+    backup_de_saves.restaurar(jogo, "v1")
+
+    assert backup_de_saves.restaurando(jogo) is True
+    assert backup_de_saves.restaurando(outro) is False
+    esperar()
+    assert backup_de_saves.restaurando(jogo) is False
+
+
+def test_restaurando_se_desfaz_quando_a_restauracao_falha(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["v1"]
+    falso.explode = RuntimeError("ludusavi quebrou")
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "v1")
+    assert backup_de_saves.restaurando(jogo) is True
+    esperar()
+
+    assert backup_de_saves.restaurando(jogo) is False
+
+
+def test_restaurando_se_desfaz_quando_a_thread_levanta(store, make_game, falso, esperar, monkeypatch):
+    def explode(*_args):
+        raise RuntimeError("levantou")
+
+    monkeypatch.setattr(threading, "excepthook", lambda _args: None)  # a thread vai morrer de propósito
+    monkeypatch.setattr(backup_de_saves, "_ler_versoes", explode)
+    falso.versoes = {"X": ["v1"]}
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "v1")
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert backup_de_saves.restaurando(jogo) is False
+    assert not backup_de_saves._trava.locked()
+    assert backup_de_saves.em_andamento() is False
+    assert tarefas.lista.rowCount() == 0
+
+
+def test_restaurar_todos_bloqueia_todos_mesmo_com_cache_vazio(store, make_game, falso, esperar):
+    falso.demora = 0.2
+    com_nome = na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    sem_nome = na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2")
+    assert not backup_de_saves._cache
+
+    backup_de_saves.restaurar_todos()
+
+    assert backup_de_saves.restaurando(com_nome) is True
+    assert backup_de_saves.restaurando(sem_nome) is False
+    esperar()
+    assert backup_de_saves.restaurando(com_nome) is False
+
+
+@pytest.mark.parametrize("quebra", ["_em_segundo_plano", "_biblioteca", "comecar_tarefa"])
+@pytest.mark.parametrize("pedido", ["backup", "um", "todos"])
+def test_pedido_que_nao_chega_a_abrir_a_thread_nao_deixa_marca(
+    store, make_game, falso, monkeypatch, flush_idle, quebra, pedido
+):
+    def explode(*_args):
+        raise RuntimeError("não abriu")
+
+    monkeypatch.setattr(backup_de_saves, quebra, explode)
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    pedir(pedido, jogo)  # não levanta: o usuário é avisado
+    flush_idle()
+
+    assert titulos() == [AVISO_DO_PEDIDO[pedido]]
+    assert tarefas.lista.rowCount() == 0
+    assert backup_de_saves.restaurando(jogo) is False
+    assert not backup_de_saves._restaurando
+    assert not backup_de_saves._jogos_restaurando
+    assert backup_de_saves._restaurando_todos == 0
+    assert backup_de_saves.em_andamento() is False
+
+
+def _sem_marcas():
+    assert not backup_de_saves._restaurando
+    assert not backup_de_saves._jogos_restaurando
+    assert backup_de_saves._restaurando_todos == 0
+
+
+def test_restauracao_aborta_se_o_nome_mudou_no_meio(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["v1"]
+    falso.demora = 0.1
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "v1")
+    jogo.ludusavi_nome = ""  # o diálogo de detalhes faz isto ao corrigir o appID, no meio da restauração
+
+    assert backup_de_saves.restaurando(jogo) is True  # a marca acompanha o jogo, não só o nome
+    esperar()
+
+    # O config já não leva o que o nome de quando pediu precisava: nada é copiado nem gravado.
+    assert falso.chamou("backup") == []
+    assert falso.restauracoes() == []
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+    assert backup_de_saves.restaurando(jogo) is False
+    _sem_marcas()
+
+
+def test_restaurar_todos_aborta_o_jogo_cujo_nome_mudou_no_meio(
+    store, make_game, falso, esperar, monkeypatch, dialogos
+):
+    falso.versoes = {"A": ["v1"], "B": ["v1"]}
+    a = na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    b = na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+    limpados = []
+
+    def executor(args, **kwargs):
+        resultado = falso(args, **kwargs)
+        if "backup" in args and not limpados:
+            # A cópia do primeiro acabou de rodar: o nome do outro some antes da vez dele.
+            feito = args[args.index("backup") + 1]
+            limpados.extend(j for j in (a, b) if j.ludusavi_nome != feito)
+            limpados[0].ludusavi_nome = ""
+        return resultado
+
+    monkeypatch.setattr(backup_de_saves, "executor", executor)
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert len(falso.chamou("backup")) == 1  # só o do jogo que ficou
+    assert len(falso.restauracoes()) == 1
+    assert list(dialogos) == [incompleta("Não foi possível restaurar o save de Jogo B.")]
+    assert toasts() == []
+    _sem_marcas()
+
+
+def test_restaurar_todos_conta_o_jogo_que_perdeu_o_nome_antes_da_lista(
+    store, make_game, falso, esperar, dialogos
+):
+    falso.versoes = {"A": ["v1"], "B": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    b = na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    with backup_de_saves.trava_dos_saves():  # a restauração espera na fila...
+        backup_de_saves.restaurar_todos()
+        b.ludusavi_nome = ""  # ...e o diálogo de detalhes limpa o nome de B antes da lista
+    esperar()
+
+    assert [c[1] for c in falso.chamou("backup")] == ["A"]
+    assert [c[1] for c in falso.restauracoes()] == ["A"]
+    assert list(dialogos) == [incompleta("Não foi possível restaurar o save de Jogo B.")]
+    assert toasts() == []
+    _sem_marcas()
+
+
+def test_restaurar_todos_em_que_todos_perderam_o_nome_avisa_a_falha(
+    store, make_game, falso, esperar, dialogos, totais
+):
+    falso.versoes = {"A": ["v1"], "B": ["v1"]}
+    a = na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    b = na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    with backup_de_saves.trava_dos_saves():
+        backup_de_saves.restaurar_todos()
+        a.ludusavi_nome = b.ludusavi_nome = ""
+    esperar()
+
+    # As cópias continuam lá: os jogos não foram restaurados, o que é falha, não "nada a restaurar".
+    assert list(dialogos) == [incompleta_de("Jogo A", "Jogo B")]
+    assert toasts() == []
+    assert falso.chamou("backup") == []
+    assert falso.restauracoes() == []
+    assert 0 not in totais
+    assert tarefas.lista.rowCount() == 0
+    assert backup_de_saves.em_andamento() is False
+    _sem_marcas()
+
+
+def test_restaurar_todos_sem_copias_avisa_que_nada_ha_mesmo_com_nome_limpo(
+    store, make_game, falso, esperar, dialogos
+):
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    b = na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    with backup_de_saves.trava_dos_saves():
+        backup_de_saves.restaurar_todos()
+        b.ludusavi_nome = ""
+    esperar()
+
+    # Nenhum dos dois tinha cópia: perder o nome não faz de B uma falha.
+    assert list(dialogos) == [NADA_PARA_RESTAURAR]
+    assert toasts() == []
+    assert falso.restauracoes() == []
+    _sem_marcas()
+
+
+def test_restaurar_todos_usa_o_outro_jogo_com_o_mesmo_nome(store, make_game, falso, esperar):
+    falso.versoes = {"X": ["v1"]}
+    # O mesmo jogo em três lojas: um nome só no Ludusavi.
+    a = na_biblioteca(store, make_game, game_id="a", name="Jogo", steam_appid="1", ludusavi_nome="X")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo", steam_appid="1", ludusavi_nome="X")
+    c = na_biblioteca(store, make_game, game_id="c", name="Jogo", steam_appid="1", ludusavi_nome="X")
+
+    with backup_de_saves.trava_dos_saves():
+        backup_de_saves.restaurar_todos()
+        a.ludusavi_nome = c.ludusavi_nome = ""  # o primeiro e o último; o do meio segue com o nome
+    esperar()
+
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+    assert toasts() == []
+    _sem_marcas()
+
+
+def test_restaurar_todos_marca_o_objeto_mesmo_se_o_nome_for_limpo(store, make_game, falso, esperar):
+    falso.versoes["A"] = ["v1"]
+    falso.demora = 0.1
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    jogo.ludusavi_nome = ""
+
+    assert backup_de_saves.restaurando(jogo) is True
+    esperar()
+
+    assert backup_de_saves.restaurando(jogo) is False
+    _sem_marcas()
+
+
+@pytest.fixture
+def threads(monkeypatch):
+    """As threads de trabalho que o módulo abre, para o teste esperar só por uma delas."""
+    abertas: list[threading.Thread] = []
+
+    def abrir(alvo, *argumentos):
+        thread = threading.Thread(target=alvo, args=argumentos, daemon=True)
+        abertas.append(thread)
+        thread.start()
+
+    monkeypatch.setattr(backup_de_saves, "_em_segundo_plano", abrir)
+    yield abertas
+    for thread in abertas:  # mesmo que o teste falhe antes de esperar (ver `esperar`)
+        thread.join(10)
+
+
+def _espera_a_primeira_terminar(abertas, flush_idle):
+    """Espera uma das threads acabar e entrega à tela o que ela deixou; a outra segue na vez."""
+    limite = time.monotonic() + 10
+    while all(thread.is_alive() for thread in abertas):
+        assert time.monotonic() < limite
+        time.sleep(0.01)
+    flush_idle()
+    assert [thread.is_alive() for thread in abertas].count(True) == 1
+
+
+def test_duas_restauracoes_seguidas_seguram_a_marca(store, make_game, falso, esperar, flush_idle, threads):
+    falso.versoes["X"] = ["v1"]
+    falso.demora = 0.1
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.restaurar(jogo, "v1")
+    backup_de_saves.restaurar(jogo, "v1")  # na fila, atrás da trava da primeira
+    _espera_a_primeira_terminar(threads, flush_idle)
+
+    assert backup_de_saves.restaurando(jogo) is True
+    esperar()
+    assert backup_de_saves.restaurando(jogo) is False
+
+
+def test_dois_restaurar_todos_seguidos_seguram_a_marca(store, make_game, falso, esperar, flush_idle, threads):
+    falso.versoes["A"] = ["v1"]
+    falso.demora = 0.1
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+
+    backup_de_saves.restaurar_todos()
+    backup_de_saves.restaurar_todos()
+    _espera_a_primeira_terminar(threads, flush_idle)
+
+    assert backup_de_saves.restaurando(jogo) is True
+    esperar()
+    assert backup_de_saves.restaurando(jogo) is False
+
+
+def test_trocar_pasta_segura_a_trava(store, falso, esperar, monkeypatch, tmp_path):
+    visto = []
+    monkeypatch.setattr(pasta, "trocar", lambda nova: visto.append((nova, backup_de_saves._trava.locked())))
+
+    backup_de_saves.trocar_pasta(tmp_path / "nova")
+    esperar()
+
+    assert visto == [(tmp_path / "nova", True)]
+    assert not backup_de_saves._trava.locked()
+    assert falso.chamou("backups")  # o cache é relido depois da troca
+
+
+def test_trocar_pasta_recusada_solta_a_trava_e_avisa_quem_chamou(store, falso, tmp_path):
+    with pytest.raises(pasta.TrocaRecusada):
+        backup_de_saves.trocar_pasta(pasta.atual())
+    assert not backup_de_saves._trava.locked()
+
+
+# -- restauração segura ------------------------------------------------------
+
+
+def _jogo_x(store, make_game, versoes, falso):
+    falso.versoes["X"] = versoes
+    return na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+
+def test_restaurar_segue_a_ordem(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v3", "v2", "v1"], falso)
+
+    backup_de_saves.restaurar(jogo, "v2")
+    esperar()
+
+    assert [c for c in falso.comandos if c[0] != "backups"] == [
+        ["backup", "X", "--force", "--full-limit", "4"],
+        ["restore", "X", "--force", "--preview", "--backup", "v2"],
+        ["restore", "X", "--force", "--backup", "v2"],
+    ]
+    assert toasts() == []
+
+
+def _nada_foi_tocado(falso) -> None:
+    assert falso.chamou("backup") == []
+    assert falso.chamou("restore") == []
+
+
+def test_versao_danificada_nao_restaura(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v2", "v1"], falso)
+    backup_de_saves.atualizar_cache()
+    esperar()
+    zip_ = falso.pasta / "X" / "v2"
+    bruto = bytearray(zip_.read_bytes())
+    bruto[bruto.index(b"0123456789")] ^= 0xFF
+    zip_.write_bytes(bruto)
+
+    backup_de_saves.restaurar(jogo, "v2")
+    esperar()
+
+    _nada_foi_tocado(falso)
+    assert titulos() == ["A versão escolhida dos saves de Meu Jogo está danificada e não foi restaurada."]
+
+
+def test_versao_que_sumiu_nao_restaura(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v2", "v1"], falso)
+    backup_de_saves.atualizar_cache()
+    esperar()
+    (falso.pasta / "X" / "v2").unlink()  # a retenção ou o OneDrive levou o zip depois da lista
+
+    backup_de_saves.restaurar(jogo, "v2")
+    esperar()
+
+    _nada_foi_tocado(falso)
+    assert titulos() == ["A versão escolhida dos saves de Meu Jogo está danificada e não foi restaurada."]
+
+
+def test_versao_que_nao_existe_mais_nao_restaura(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+
+    backup_de_saves.restaurar(jogo, "apagada")
+    esperar()
+
+    _nada_foi_tocado(falso)
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+
+
+@pytest.mark.parametrize(("quantas", "limite"), [(5, "6"), (6, "7"), (255, "255")])
+def test_limite_da_copia_e_versoes_mais_um(store, make_game, falso, esperar, quantas, limite):
+    jogo = _jogo_x(store, make_game, [f"v{n}" for n in range(quantas, 0, -1)], falso)
+
+    backup_de_saves.restaurar(jogo, "v1")  # a mais antiga: a cópia não pode apagá-la
+    esperar()
+
+    assert falso.chamou("backup") == [["backup", "X", "--force", "--full-limit", limite]]
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+
+
+def test_copia_que_falha_cancela_e_marca(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.cria_versao["X"] = True
+    falso.falhas["backup"] = FALHOU
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.chamou("restore") == []
+    assert falso.marcas() == [["backups", "edit", "X", "--backup", "nova1", "--comment", "cartridges:incompleta"]]
+    assert titulos() == [
+        (
+            "Não foi possível guardar os saves atuais de Meu Jogo antes da restauração. "
+            "Verifique se o jogo está fechado e tente novamente."
+        )
+    ]
+
+
+def test_copia_marca_antes_de_restaurar(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v2", "v1"], falso)
+    falso.cria_versao["X"] = True
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.marcas() == [
+        ["backups", "edit", "X", "--backup", "nova1", "--comment", "cartridges:antes-de-restaurar"]
+    ]
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+    assert toasts() == []
+
+
+def test_copia_sem_mudanca_nao_marca(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v2", "v1"], falso)
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.marcas() == []  # a mais nova é de antes da cópia: não é dela
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+
+
+def test_destino_proibido_nao_restaura(store, make_game, falso, esperar, caplog):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.previas["X"] = {"C:/Windows/x.ini": {}}
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.restauracoes() == []
+    assert titulos() == ["O backup dos saves de Meu Jogo contém arquivos fora das pastas de save e não foi restaurado."]
+    assert "C:/Windows/x.ini" in caplog.text  # o caminho só no log
+
+
+def test_conferencia_que_levanta_nao_restaura(store, make_game, falso, esperar, monkeypatch):
+    def unidade_travada(*_args):
+        raise OSError("unidade travada pelo BitLocker")
+
+    monkeypatch.setattr(conferencia, "recusado", unidade_travada)
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.restauracoes() == []
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+
+
+def test_redirecionamento_vai_no_config(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.no_zip["v1"] = ["drive-C/Users/NaoExiste123/AppData/a.sav"]
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+    assert falso.configs["restore"]["redirects"] == [
+        {"kind": "restore", "source": "C:/Users/NaoExiste123", "target": Path.home().as_posix()}
+    ]
+
+
+def test_save_do_programdata_nao_vai_para_a_pasta_do_jogo(
+    store, make_game, falso, esperar, tmp_path
+):
+    exe = tmp_path / "JogoB" / "jogo.exe"
+    exe.parent.mkdir()
+    exe.touch()
+    falso.versoes["X"] = ["v1"]
+    jogo = na_biblioteca(
+        store,
+        make_game,
+        game_id="a",
+        name="Meu Jogo",
+        steam_appid="7",
+        ludusavi_nome="X",
+        executable=str(exe),
+    )
+    falso.no_zip["v1"] = ["drive-C/ProgramData/NaoExiste123/Jogo/Profile/x.sav"]
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.configs["restore"].get("redirects", []) == []
+
+
+def test_sem_manifesto_nao_restaura(store, make_game, falso, esperar, tmp_path, caplog):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    _sem_manifesto(tmp_path)
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    _nada_foi_tocado(falso)
+    # Tentou baixar; sem rede o manifesto não veio.
+    assert falso.chamou("manifest") == [["manifest", "update", "--force"]]
+    # A falha é do app, e não do jogo aberto: o aviso genérico, e o motivo no log.
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+    assert "manifesto" in caplog.text
+
+
+def test_sem_manifesto_baixa_e_restaura(store, make_game, falso, esperar, tmp_path):
+    # Instalação nova (ou PC formatado): o backup do app não leva a pasta do Ludusavi.
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    _sem_manifesto(tmp_path)
+    falso.baixa_manifesto = True
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.chamou("manifest") == [["manifest", "update", "--force"]]
+    assert len(falso.restauracoes()) == 1
+    assert titulos() == []
+
+
+def test_sem_manifesto_baixa_e_faz_backup(store, make_game, falso, esperar, tmp_path):
+    _sem_manifesto(tmp_path)
+    falso.baixa_manifesto = True
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert len(falso.chamou("backup")) == 1
+    assert titulos() == []
+
+
+def test_sem_manifesto_e_sem_rede_restaurar_todos_tenta_baixar_uma_vez(
+    store, make_game, falso, esperar, tmp_path, dialogos
+):
+    # Sem rede o Ludusavi pode ficar parado até o limite, com a trava dos saves presa:
+    # uma tentativa por jogo multiplicaria a espera.
+    falso.versoes = {"A": ["v1"], "B": ["v1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+    _sem_manifesto(tmp_path)
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert len(falso.chamou("manifest")) == 1
+    assert falso.restauracoes() == []
+    assert list(dialogos) == [incompleta_de("Jogo A", "Jogo B")]
+
+
+def test_sem_manifesto_tenta_baixar_de_novo_depois_da_pausa(
+    store, make_game, falso, esperar, tmp_path, monkeypatch
+):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    _sem_manifesto(tmp_path)
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+    # A rede voltou e a pausa passou.
+    falso.baixa_manifesto = True
+    monkeypatch.setattr(
+        backup_de_saves, "_manifesto_falhou_em", time.monotonic() - backup_de_saves.PAUSA_DO_MANIFESTO
+    )
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert len(falso.chamou("manifest")) == 2
+    assert len(falso.restauracoes()) == 1
+
+
+def test_baixar_manifesto_tem_limite_de_tempo_curto(tmp_path):
+    limites = []
+
+    def executor(args, **kwargs):
+        limites.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    ludusavi.baixar_manifesto(tmp_path / "ludusavi", executor)
+
+    assert limites and limites[0] < ludusavi.LIMITE_DE_TEMPO
+
+
+def test_sem_manifesto_baixa_e_procura_o_nome(store, make_game, falso, esperar, tmp_path):
+    _sem_manifesto(tmp_path)
+    falso.baixa_manifesto = True
+    falso.achados[("appid", "42")] = "Jogo Raro"
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Jogo Raro", steam_appid="42")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert [c[:2] for c in falso.chamou("find")] == [["find", "--steam-id"]]
+    assert jogo.ludusavi_nome == "Jogo Raro"
+    assert len(falso.chamou("backup")) == 1
+
+
+# Onde um jogo grava o save: a prévia só passa com destinos dentro das pastas do usuário.
+SAVE_VIVO = (Path.home() / "AppData" / "Local" / "NaoExiste123" / "s.sav").as_posix()
+
+
+def test_save_que_a_copia_nao_guardou_nao_e_sobrescrito(store, make_game, falso, esperar, caplog):
+    # O config de agora não cobre o caminho (o manifesto perdeu o jogo, a pasta antiga do
+    # jogo ainda existe): a cópia dos saves atuais não o tem, e restaurar o perderia.
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.previas["X"] = {SAVE_VIVO: {"change": "Different", "bytes": 1}}
+    falso.conferidos["X"] = {"C:/Jogos/X/outro.ini": {"change": "Same", "bytes": 1}}
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.restauracoes() == []
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+    assert SAVE_VIVO in caplog.text  # o caminho só no log
+
+
+def test_save_que_a_copia_guardou_e_restaurado(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.previas["X"] = {
+        SAVE_VIVO: {"change": "Different", "bytes": 1},
+        SAVE_VIVO + ".novo": {"change": "New", "bytes": 1},  # não existe: nada a perder
+    }
+    falso.conferidos["X"] = {SAVE_VIVO.upper().replace("/", "\\"): {"change": "Same", "bytes": 1}}
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert falso.restauracoes() == [["restore", "X", "--force", "--backup", "v1"]]
+    assert toasts() == []
+
+
+def test_previa_que_falha_nao_restaura(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.falhas["restore --preview"] = FALHOU
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    assert len(falso.chamou("restore")) == 1  # só a prévia
+    assert falso.restauracoes() == []
+    assert titulos() == ["Não foi possível restaurar o save de Meu Jogo."]
+
+
+def test_previa_e_restore_veem_o_mesmo_config(store, make_game, falso, esperar):
+    jogo = _jogo_x(store, make_game, ["v1"], falso)
+    falso.no_zip["v1"] = ["drive-C/Users/NaoExiste123/AppData/a.sav"]
+
+    backup_de_saves.restaurar(jogo, "v1")
+    esperar()
+
+    vistos = [config for comando, config in falso.configs_por_chamada if comando[0] == "restore"]
+    assert len(vistos) == 2  # a prévia e o `restore`
+    assert vistos[0] == vistos[1]
+    assert vistos[0]["redirects"]  # o redirecionamento do usuário, nos dois
+
+
+def test_restaurar_todos_pula_incompleta(store, make_game, falso, esperar, dialogos):
+    falso.versoes = {"A": ["v3", "v2"], "B": ["w1"]}
+    falso.comentarios[("A", "v3")] = "cartridges:incompleta"
+    falso.comentarios[("B", "w1")] = "cartridges:incompleta"
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="Jogo B", steam_appid="2", ludusavi_nome="B")
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert [c[1] for c in falso.chamou("backup")] == ["A"]  # B nem ganha cópia
+    assert falso.restauracoes() == [["restore", "A", "--force", "--backup", "v2"]]
+    assert list(dialogos) == [
+        incompleta(
+            "Não foi possível restaurar os saves de Jogo B: "
+            "todas as cópias deste jogo estão incompletas."
+        )
+    ]
+    assert toasts() == []
+
+
+@pytest.mark.parametrize(
+    ("incompletas", "argumentos"), [(0, []), (1, ["--full-limit", "6"]), (2, ["--full-limit", "7"])]
+)
+def test_backup_guarda_as_boas_alem_das_incompletas(store, make_game, falso, esperar, incompletas, argumentos):
+    # A retenção do Ludusavi conta as incompletas: sem a folga, cada falha empurraria
+    # para fora uma versão boa.
+    falso.versoes["X"] = [f"v{i}" for i in range(6)]
+    for i in range(incompletas):
+        falso.comentarios[("X", f"v{i}")] = "cartridges:incompleta"
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+    backup_de_saves.atualizar_cache()
+    esperar()
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("backup") == [["backup", "X", "--force", *argumentos]]
+
+
+def test_copia_que_falha_e_depois_backup_normal_guarda_as_boas(store, make_game, falso, esperar):
+    falso.versoes["X"] = ["v1", "v2", "v3", "v4", "v5"]
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", steam_appid="7", ludusavi_nome="X")
+    falso.falhas["backup"] = FALHOU
+    falso.cria_versao["X"] = True  # a cópia dos saves atuais fica pela metade
+
+    backup_de_saves.restaurar(jogo, "v3")
+    esperar()
+    del falso.falhas["backup"]
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    # A incompleta da cópia que falhou não toma o lugar de uma das 5 boas.
+    assert falso.chamou("backup")[-1] == ["backup", "X", "--force", "--full-limit", "6"]
+
+
+def test_restaurar_todos_com_uma_falha_mostra_o_aviso_dela(
+    store, make_game, falso, esperar, monkeypatch, dialogos
+):
+    # O caso visto no app: a cópia dos saves atuais de um jogo falhou (arquivo travado).
+    falso.versoes = {"A": ["v1"], "B": ["w1"]}
+    na_biblioteca(store, make_game, game_id="a", name="Jogo A", steam_appid="1", ludusavi_nome="A")
+    na_biblioteca(store, make_game, game_id="b", name="CONTROL Resonant", steam_appid="2", ludusavi_nome="B")
+
+    def copia_de_b_falha(args, **kwargs):
+        if args[args.index("--try-manifest-update") + 1 : -1] == ["backup", "B", "--force", "--full-limit", "2"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(FALHOU), "")
+        return falso(args, **kwargs)
+
+    monkeypatch.setattr(backup_de_saves, "executor", copia_de_b_falha)
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert [c[1] for c in falso.restauracoes()] == ["A"]
+    assert list(dialogos) == [
+        incompleta(
+            "Não foi possível guardar os saves atuais de CONTROL Resonant antes da restauração. "
+            "Verifique se o jogo está fechado e tente novamente."
+        )
+    ]
+    assert toasts() == []
+
+
+def test_restaurar_todos_com_varias_falhas_nomeia_os_jogos(store, make_game, falso, esperar, dialogos):
+    falso.versoes = {"A": ["v1"], "B": ["v1"], "C": ["v1"]}
+    for letra in "ABC":
+        na_biblioteca(
+            store, make_game, game_id=letra, name=f"Jogo {letra}", steam_appid="1", ludusavi_nome=letra
+        )
+    falso.falhas["restore"] = FALHOU
+
+    backup_de_saves.restaurar_todos()
+    esperar()
+
+    assert list(dialogos) == [incompleta_de("Jogo A", "Jogo B", "Jogo C")]
+    assert toasts() == []
+
+
+def test_sem_appid_com_nome_gravado_continua_com_backup(store, make_game, falso, esperar):
+    jogo = na_biblioteca(store, make_game, game_id="a", name="Meu Jogo", ludusavi_nome="X")
+
+    backup_de_saves.no_fim_da_sessao(jogo)
+    esperar()
+
+    assert falso.chamou("find") == []
+    assert len(falso.chamou("backup")) == 1
+
+
+def test_aviso_de_saves_nao_depende_do_endereco(store, make_game, monkeypatch):
+    """A marca da pergunta na tela é o `game_id`: dois objetos com o mesmo `id()` não se confundem."""
+    monkeypatch.setattr(backup_de_saves, "id", lambda _objeto: 1, raising=False)
+    um = na_biblioteca(store, make_game, game_id="a", name="Um")
+    outro = na_biblioteca(store, make_game, game_id="b", name="Outro")
+    backup_de_saves._avisar_local_desconhecido(um)  # pylint: disable=protected-access
+    backup_de_saves._avisar_local_desconhecido(outro)  # pylint: disable=protected-access
+    backup_de_saves._avisar_local_desconhecido(um)  # pylint: disable=protected-access
+    assert [c[1] for c in perguntas()] == [
+        _aviso_sem_backup("Um")[1],
+        _aviso_sem_backup("Outro")[1],
+    ]

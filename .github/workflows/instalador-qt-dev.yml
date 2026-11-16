@@ -1,0 +1,77 @@
+name: Gerar instalador Qt (desenvolvimento)
+
+# Cópia à parte do app instalado (outro AppId, pasta e dados "-dev"). Só gera o instalador como artefato:
+# não publica release, não faz commit nem push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  instalador:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      # Sem credencial no disco: o código atualizado roda depois deste passo.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # O mesmo Python do app (o de .python-version): roda os scripts e o pip --target.
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # Só avisa das versões novas; nada é gravado (quem atualiza é o instalador.yml).
+      - name: Versões novas
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python build-aux/windows/atualizar_versoes.py --verificar --json "$RUNNER_TEMP/versoes.json" || [ $? -eq 1 ]  # 1 = há versão nova
+          python - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "versoes.json"), encoding="utf-8") as f:
+              dados = json.load(f)
+          for t in dados["trocas"]:
+              print(f"::warning::Versão nova de {t['peca']}: {t['de']} para {t['para']}")
+          PY
+
+      # SDK do Qt e QWindowKit baixados por tools/baixar_qt_sdk.py (o script confere o SHA-1 e
+      # refaz o que não estiver completo).
+      - uses: actions/cache@v4
+        with:
+          path: build-aux/windows/qwk/_deps
+          key: qwk-deps-${{ hashFiles('tools/baixar_qt_sdk.py', 'build-aux/windows/qwk/compilar.bat', 'build-aux/windows/qwk/CMakeLists.txt', 'build-aux/windows/qwk/ponte.cpp') }}
+
+      - name: SDK do Qt e QWindowKit
+        run: python tools/baixar_qt_sdk.py
+
+      - name: qwk_ponte.dll
+        shell: cmd
+        run: build-aux\windows\qwk\compilar.bat
+
+      - name: Montar o app
+        run: python build-aux/windows/montar_app_qt.py --canal desenvolvimento --destino _dist/qt-dev
+
+      # Como no instalador.yml.
+      - name: Inno Setup 7
+        shell: pwsh
+        run: ./build-aux/windows/instalar_inno.ps1
+
+      - name: Instalador
+        run: |
+          $repo = (Get-Location).Path
+          & "$env:ProgramFiles\Inno Setup 7\ISCC.exe" '/DDESENVOLVIMENTO' "/DRepo=$repo" "/DPastaApp=$repo\_dist\qt-dev" "/O$repo\_dist\instalador" "$repo\_dist\qt-dev.iss"
+          if ($LASTEXITCODE -ne 0) { throw 'O ISCC falhou.' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kyron-desenvolvimento
+          path: _dist/instalador/Kyron desenvolvimento.exe
+          if-no-files-found: error

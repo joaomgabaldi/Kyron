@@ -1,0 +1,184 @@
+name: Gerar instalador (beta)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sem_atualizar:
+        type: boolean
+        default: false
+        description: "Montar com as versões já gravadas, sem atualizar"
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  instalador:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - run: git config --global core.autocrlf false
+
+      # Sem credencial no disco: o código recém-atualizado roda na montagem e na suíte. Só os passos que
+      # dão push recebem o token, no cabeçalho do próprio comando git.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # O mesmo Python do app (o de .python-version): roda os scripts e o pip --target.
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # A <release> do topo do metainfo recebe a data de Brasília (UTC-3 o ano todo desde 2019);
+      # o commit só sai se a data mudou.
+      - name: Data da release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          metainfo=data/io.github.joaomgabaldi.Cartridges.metainfo.xml.in
+          # Ponta atual do branch: num Re-run o checkout volta ao commit de antes da "Data da release".
+          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c "$auth" fetch -q --depth=1 origin "$GITHUB_REF_NAME"
+          git reset -q --hard FETCH_HEAD
+          versao=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' kyron/shared.py)
+          if [ -z "$versao" ]; then
+            echo "::error::Não achei VERSION em kyron/shared.py."
+            exit 1
+          fi
+          if pre=$(gh release view "v$versao" --json isPrerelease --jq .isPrerelease 2>/dev/null) && [ "$pre" != "true" ]; then
+            echo "::error::A versão v$versao já foi publicada. Suba a versão em kyron/shared.py."
+            exit 1
+          fi
+          python build-aux/windows/data_da_release.py "$metainfo" "$versao" "$(date -u -d '-3 hours' +%Y-%m-%d)"
+          if ! git diff --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -am "Data da release $versao"
+            git -c "$auth" push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+          echo "VERSAO=$versao" >> "$GITHUB_ENV"
+
+      # Sobe as versões das peças (Python, Qt, bibliotecas, ffmpeg, Ludusavi, Inno) para as mais novas
+      # compatíveis. Só reescreve arquivos do checkout: o commit sai depois da suíte e da montagem.
+      - name: Atualizar versões
+        if: ${{ !inputs.sem_atualizar }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python build-aux/windows/atualizar_versoes.py --json "$RUNNER_TEMP/versoes.json"
+          python - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "versoes.json"), encoding="utf-8") as f:
+              dados = json.load(f)
+          for aviso in dados["avisos"]:
+              print("::warning::" + " ".join(aviso.split()).replace("%", "%25"))
+          linha = " ".join(dados["linha"].split())  # uma linha só: o texto veio da rede
+          if linha:
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  print("LINHA_DAS_VERSOES=" + linha, file=f)
+          PY
+          # Também vale quando só os hashes das rodas mudaram (a linha vem vazia).
+          git diff --name-only > "$RUNNER_TEMP/arquivos_das_versoes.txt"
+          if [ -s "$RUNNER_TEMP/arquivos_das_versoes.txt" ]; then
+            echo "VERSOES_MUDARAM=1" >> "$GITHUB_ENV"
+          fi
+
+      # De novo: se o .python-version subiu, este passo instala o Python novo.
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      # SDK do Qt e QWindowKit baixados por tools/baixar_qt_sdk.py (o script confere o SHA-1 e
+      # refaz o que não estiver completo).
+      - uses: actions/cache@v4
+        with:
+          path: build-aux/windows/qwk/_deps
+          key: qwk-deps-${{ hashFiles('tools/baixar_qt_sdk.py', 'build-aux/windows/qwk/compilar.bat', 'build-aux/windows/qwk/CMakeLists.txt', 'build-aux/windows/qwk/ponte.cpp') }}
+
+      - name: SDK do Qt e QWindowKit
+        run: python tools/baixar_qt_sdk.py
+
+      - name: qwk_ponte.dll
+        shell: cmd
+        run: build-aux\windows\qwk\compilar.bat
+
+      # Baixa e confere o ffmpeg e o Ludusavi (SHA-256 fixos no script): sem eles o canal final não monta.
+      - name: Montar o app
+        run: python build-aux/windows/montar_app_qt.py --canal final --destino _dist/qt-final
+
+      # A pasta roda sozinha aqui, com dados temporários: é a única prova do libwebp_anim do ffmpeg
+      # e do que falta na pasta antes de ir para quem instala. Falhou, não sai instalador.
+      - name: Verificar a pasta montada
+        run: .\_dist\qt-final\python\python.exe -B build-aux\windows\verificar_pasta.py _dist\qt-final
+
+      # A suíte nunca rodou na CI. Falhou, o job termina aqui: nada é commitado nem publicado.
+      - name: Suíte
+        shell: bash
+        run: |
+          # Os testes de data esperam o fuso de quem desenvolve (o runner vem em UTC).
+          tzutil //s "E. South America Standard Time"
+          python -m pip install --require-hashes -r requirements-dev.txt
+          # Testes de tempo instáveis (docs/TODO.md) têm uma segunda chance, sozinhos; um defeito real falha de novo.
+          python -m pytest -n auto -q || python -m pytest -q -p no:xdist --lf
+
+      # Versão e SHA-256 ficam em instalar_inno.ps1 (o atualizador os reescreve; workflow ele não toca).
+      - name: Inno Setup 7
+        shell: pwsh
+        run: ./build-aux/windows/instalar_inno.ps1
+
+      - name: Instalador
+        run: |
+          $repo = (Get-Location).Path
+          & "$env:ProgramFiles\Inno Setup 7\ISCC.exe" "/DRepo=$repo" "/DPastaApp=$repo\_dist\qt-final" "/O$repo\_dist\instalador" "$repo\_dist\qt-final.iss"
+          if ($LASTEXITCODE -ne 0) { throw 'O ISCC falhou.' }
+
+      # Depois do ISCC: um Inno novo que não compile o [Code] nunca chega à main.
+      - name: Commit das versões
+        if: env.VERSOES_MUDARAM == '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mensagem="${LINHA_DAS_VERSOES:-Versões atualizadas: hashes das rodas}"
+          auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Só o que o atualizador mexeu (a lista foi guardada antes da montagem e da suíte).
+          while IFS= read -r arquivo; do git add -- "$arquivo"; done < "$RUNNER_TEMP/arquivos_das_versoes.txt"
+          git commit -m "$mensagem"
+          # Um push de outra pessoa durante o build não pode derrubar o passo; --autostash: o rebase recusa
+          # rodar com arquivo rastreado modificado fora da lista acima.
+          git -c "$auth" pull -q --rebase --autostash origin "$GITHUB_REF_NAME"
+          git -c "$auth" push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Publicar pré-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          versao="$VERSAO"
+          tag="v$versao"
+          # Última versão final publicada: as notas juntam as que vieram depois dela.
+          anterior=$(gh release list --exclude-pre-releases --exclude-drafts -L 1 --json tagName --jq '.[0].tagName // ""')
+          python build-aux/windows/notas_release.py data/io.github.joaomgabaldi.Cartridges.metainfo.xml.in "$versao" "${anterior#v}" > notas.md
+          cp "_dist/instalador/Kyron Windows.exe" Kyron.Windows.exe
+          if pre=$(gh release view "$tag" --json isPrerelease --jq .isPrerelease 2>/dev/null); then
+            if [ "$pre" != "true" ]; then
+              echo "::error::A versão $tag já foi publicada. Suba a versão em kyron/shared.py."
+              exit 1
+            fi
+            git tag -f "$tag"
+            auth="http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c "$auth" push -f origin "refs/tags/$tag"
+            gh release edit "$tag" --notes-file notas.md
+            gh release upload "$tag" Kyron.Windows.exe --clobber
+          else
+            gh release create "$tag" Kyron.Windows.exe --prerelease --latest=false \
+              --target "$(git rev-parse HEAD)" --title "Kyron $versao" --notes-file notas.md
+          fi

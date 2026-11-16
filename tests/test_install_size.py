@@ -1,0 +1,172 @@
+# test_install_size.py
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Medir quanto um jogo ocupa no disco, e dizer o número em português.
+
+A parte interessante é o que a medição deixa de contar: uma pasta ilegível não derruba a soma (instalações do Game Pass
+negam acesso no meio do caminho) e um link não é seguido (o mesmo arquivo dos dois lados de uma junção dobraria o jogo).
+Os números conferem com o Explorer: base 1024, uma casa decimal, vírgula.
+"""
+
+import os
+
+import pytest
+
+from kyron.utils.install_size import (
+    folder_size,
+    format_size,
+    install_size_folder,
+)
+
+GIB = 1024**3
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    (
+        (0, ""),  # desconhecido, não "ocupa nada"
+        (-1, ""),
+        (512, "512 B"),
+        (2048, "2 KB"),
+        (3 * 1024 * 1024, "3 MB"),
+        (GIB, "1 GB"),
+        (int(GIB * 87.42), "87,4 GB"),
+        (2 * 1024**4, "2 TB"),
+    ),
+)
+def test_format_size(size: int, expected: str) -> None:
+    assert format_size(size) == expected
+
+
+def write(path, size: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\0" * size)
+
+
+def test_folder_size_sums_every_level(tmp_path) -> None:
+    write(tmp_path / "game.exe", 1000)
+    write(tmp_path / "bin" / "data.pak", 2000)
+    write(tmp_path / "bin" / "deep" / "more.pak", 4000)
+
+    assert folder_size(str(tmp_path)) == 7000
+    assert folder_size(str(tmp_path / "bin")) == 6000
+
+
+def test_folder_size_of_missing_folder_is_zero(tmp_path) -> None:
+    """Um jogo que saiu do disco mede zero em vez de estourar."""
+    assert folder_size(str(tmp_path / "desinstalado")) == 0
+
+
+def test_a_folder_holding_a_whole_library_is_refused(tmp_path) -> None:
+    """Um atalho para ``steam.exe -applaunch`` nomeia o cliente, cuja pasta tem a biblioteca Steam inteira: medir isso daria um jogo de 400 GB."""
+    steam = tmp_path / "Games" / "Steam"
+    write(steam / "steam.exe", 100)
+    write(steam / "steamapps" / "common" / "Outro Jogo" / "data.pak", 5000)
+
+    assert install_size_folder(f'"{steam}\\steam.exe" -applaunch 440') == ""
+
+    # E o jogo ao lado, que não guarda a biblioteca de ninguém, continua medindo
+    jogo = tmp_path / "Games" / "Hollow Knight"
+    write(jogo / "hollow_knight.exe", 100)
+    assert install_size_folder(f'"{jogo}\\hollow_knight.exe"') == str(jogo).replace(
+        "/", "\\"
+    )
+
+
+def make_junction(link, target) -> None:
+    """Junção NTFS de verdade — o link que se cria SEM privilégio (mklink /J)."""
+    try:
+        import _winapi  # pylint: disable=import-outside-toplevel
+
+        _winapi.CreateJunction(str(target), str(link))
+    except (ImportError, AttributeError, OSError) as error:
+        pytest.skip(f"não deu para criar junção aqui: {error}")
+
+
+def test_folder_size_does_not_follow_junctions(tmp_path) -> None:
+    """`is_dir(follow_symlinks=False)` é True para junção, então o alvo era contado junto e o tamanho dobrava."""
+    write(tmp_path / "game" / "data.pak", 10)
+    write(tmp_path / "biblioteca" / "grande.pak", 1000)
+    make_junction(tmp_path / "game" / "resto", tmp_path / "biblioteca")
+
+    assert folder_size(str(tmp_path / "game")) == 10
+
+
+def test_folder_size_survives_a_junction_cycle(tmp_path) -> None:
+    """Junção para o próprio ancestral: sem o `is_junction()` a varredura re-entrava em círculo."""
+    write(tmp_path / "game" / "data.pak", 10)
+    make_junction(tmp_path / "game" / "loop", tmp_path / "game")
+
+    assert folder_size(str(tmp_path / "game")) == 10
+
+
+def test_folder_size_ignores_links(tmp_path) -> None:
+    """O mesmo arquivo do outro lado de um link não é contado duas vezes."""
+    write(tmp_path / "game" / "data.pak", 3000)
+    link = tmp_path / "game" / "atalho"
+    try:
+        os.symlink(tmp_path / "game", link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("criar link simbólico exige privilégio no Windows")
+
+    assert folder_size(str(tmp_path / "game")) == 3000
+
+
+import ast
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+from PySide6.QtCore import QEventLoop, QTimer
+
+from kyron import shared
+from kyron.utils import install_size
+
+
+def _rodar_ate(condicao, limite=5.0) -> bool:
+    fim = time.monotonic() + limite
+    while not condicao() and time.monotonic() < fim:
+        laco = QEventLoop()
+        QTimer.singleShot(10, laco.quit)
+        laco.exec()
+    return condicao()
+
+
+@pytest.mark.parametrize("modulo", ("install_size", "updates_checker"))
+def test_sem_gi(modulo: str) -> None:
+    fonte = Path(__file__).resolve().parent.parent / "kyron" / "utils" / f"{modulo}.py"
+    importados = set()
+    for no in ast.walk(ast.parse(fonte.read_text(encoding="utf-8"))):
+        if isinstance(no, ast.Import):
+            importados.update(a.name.split(".")[0] for a in no.names)
+        elif isinstance(no, ast.ImportFrom) and no.module:
+            importados.add(no.module.split(".")[0])
+    assert "gi" not in importados
+
+
+def test_tamanho_medido_chega_na_principal(monkeypatch, tmp_path, store, make_game) -> None:
+    pasta = tmp_path / "Jogo"
+    write(pasta / "jogo.exe", 3000)
+    jogo = make_game(game_id="a", name="a", install_size=0, install_size_ts=0)
+    store.add_game(jogo, {})
+    monkeypatch.setattr(install_size, "install_size_folder", lambda _cmd: str(pasta))
+    vistos = []
+    aplicar = install_size.InstallSizeSweep._apply
+    monkeypatch.setattr(
+        install_size.InstallSizeSweep,
+        "_apply",
+        lambda self, *a: (vistos.append(threading.current_thread() is threading.main_thread()), aplicar(self, *a))[1],
+    )
+
+    varredura = install_size.InstallSizeSweep()
+    try:
+        varredura.run_async()
+        assert _rodar_ate(lambda: vistos)
+    finally:
+        varredura.stop()
+
+    assert vistos == [True]
+    assert (jogo.install_size, jogo.saves, jogo.updates) == (3000, 1, 1)
+    assert jogo.install_size_ts > 0

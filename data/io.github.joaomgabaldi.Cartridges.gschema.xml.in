@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="cartridges">
+
+  <schema id="@APP_ID@" path="@PREFIX@/">
+    <key name="auto-import" type="b">
+        <default>false</default>
+    </key>
+    <key name="minimize-after-launch" type="b">
+      <default>false</default>
+    </key>
+    <key name="playtime-tracking" type="b">
+      <default>true</default>
+    </key>
+    <key name="process-tracking-grace" type="i">
+      <default>5</default>
+    </key>
+    <key name="remove-missing" type="b">
+      <default>true</default>
+    </key>
+    <key name="shortcuts" type="b">
+      <default>true</default>
+    </key>
+    <key name="shortcuts-location" type="s">
+      <default>""</default>
+    </key>
+    <key name="shortcuts-recursive" type="b">
+      <default>true</default>
+    </key>
+    <key name="steam-metadata" type="b">
+      <default>true</default>
+    </key>
+    <key name="hltb-metadata" type="b">
+      <default>true</default>
+    </key>
+    <key name="sgdb-key" type="s">
+      <default>""</default>
+    </key>
+    <key name="conquistas-chave-steam" type="s">
+      <default>""</default>
+    </key>
+    <key name="conquistas-mostrar-ocultas" type="b">
+      <default>false</default>
+    </key>
+    <key name="conquistas-aviso-posicao" type="s">
+      <default>"inferior-direito"</default>
+    </key>
+    <key name="conquistas-aviso" type="b">
+      <default>true</default>
+    </key>
+    <key name="conquistas-aviso-som" type="b">
+      <default>true</default>
+    </key>
+    <key name="conquistas-aviso-som-volume" type="i">
+      <range min="10" max="100"/>
+      <default>100</default>
+    </key>
+    <key name="conquistas-iluminacao" type="b">
+      <default>true</default>
+    </key>
+    <!-- A cor e o estilo do pulso da iluminação ao desbloquear uma conquista.
+         Padrão: o dourado (matiz 45, saturação 1000) e o estilo "piscar". -->
+    <key name="conquistas-pulso-matiz" type="i">
+      <default>45</default>
+    </key>
+    <key name="conquistas-pulso-saturacao" type="i">
+      <default>1000</default>
+    </key>
+    <key name="conquistas-pulso-estilo" type="s">
+      <default>"respirar"</default>
+    </key>
+    <key name="sgdb" type="b">
+      <default>false</default>
+    </key>
+    <key name="sgdb-prefer" type="b">
+      <default>false</default>
+    </key>
+    <key name="sgdb-animated" type="b">
+      <default>false</default>
+    </key>
+    <key name="cover-autoplay" type="b">
+      <default>false</default>
+    </key>
+    <!-- O assistente de primeira abertura já foi concluído (ou pulado) e não volta a aparecer. -->
+    <key name="assistente-concluido" type="b">
+      <default>false</default>
+    </key>
+    <key name="library-rows" type="u">
+      <default>0</default>
+    </key>
+    <key name="gamepad" type="b">
+      <default>false</default>
+    </key>
+    <key name="gamepad-rumble" type="b">
+      <default>true</default>
+    </key>
+    <key name="big-picture-ao-conectar" type="b">
+      <default>false</default>
+    </key>
+    <key name="big-picture-som" type="b">
+      <default>true</default>
+    </key>
+    <!-- Send the main window to another monitor, maximized, while a game runs,
+         instead of minimizing it. Off means today's behaviour, unchanged. -->
+    <key name="session-move-window" type="b">
+      <default>false</default>
+    </key>
+    <!-- Which monitor to send it to, as the monitor's device interface path
+         ("\\?\DISPLAY#DEL4123#5&...#{e6f07b5f-...}"), which names the screen
+         and the port it is plugged into. Older versions stored the Win32 device
+         name ("\\.\DISPLAY2"), which Windows swaps between screens; it is still
+         accepted and rewritten when the preferences open. Empty, the primary
+         monitor, or a monitor that is no longer attached, means the window stays
+         where it is. Not an index: unplugging a screen renumbers the list, and an
+         index would then name a different monitor rather than none. -->
+    <key name="session-monitor" type="s">
+      <default>""</default>
+    </key>
+    <!-- Vestir os monitores além do principal com a arte do jogo enquanto a
+         sessão corre. Sem um segundo monitor, o app a desliga e não religa. -->
+    <key name="session-wallpaper" type="b">
+      <default>false</default>
+    </key>
+    <!-- O papel de parede de cada monitor antes da sessão, em JSON, para o
+         caminho de volta. Em disco e não em memória porque o app fechado (ou
+         morto) no meio da sessão deixaria as telas vestidas de um jogo que já
+         acabou; vazio quer dizer "nenhuma sessão trocou nada". -->
+    <key name="session-wallpaper-saved" type="s">
+      <default>""</default>
+    </key>
+    <!-- Brilho das fitas de LED (0 a 1000, como o módulo Tuya conta) para o
+         jogo que não escolheu o seu. O padrão baixo é deliberado: a fita mora
+         atrás do monitor, e luz forte ali lava o preto da tela. -->
+    <key name="fita-brilho-padrao" type="i">
+      <default>180</default>
+    </key>
+    <!-- A cor das fitas de LED quando não há jogo correndo — a "cor do app".
+         Matiz de 0 a 359 e saturação de 0 a 1000, como o módulo Tuya conta; o
+         brilho continua sendo o brilho padrão acima. O padrão é o azul do
+         Kyron (#158AFF), e é para ele que o botão de voltar leva. -->
+    <key name="fita-matiz-app" type="i">
+      <default>210</default>
+    </key>
+    <key name="fita-saturacao-app" type="i">
+      <default>918</default>
+    </key>
+    <!-- Fazer as fitas de LED acompanharem o app e a sessão. Desligado até que
+         haja fita configurada: sem chave local não há como falar com elas. -->
+    <key name="session-fita" type="b">
+      <default>false</default>
+    </key>
+    <!-- Experimento: durante a sessão, a cor das fitas acompanha devagar a cor
+         predominante do monitor do jogo, em vez de ficar na cor fixa dele.
+         Jogo com cor escolhida à mão continua fixo. -->
+    <key name="fita-acompanha-tela" type="b">
+      <default>false</default>
+    </key>
+    <!-- O estado de cada fita antes de o app mexer, em JSON, para o caminho de
+         volta. Em disco e não em memória porque o app morto no meio da sessão
+         deixaria as fitas vestidas de um jogo que já acabou; vazio quer dizer
+         "nada foi trocado". -->
+    <key name="fita-estado-anterior" type="s">
+      <default>""</default>
+    </key>
+    <!-- Opcional: a busca SFW do wallhaven responde sem chave nenhuma. Ela
+         serve para NSFW e para os filtros da conta de quem a informar. -->
+    <key name="wallhaven-key" type="s">
+      <default>""</default>
+    </key>
+    <!-- How often (in hours) the repack update feed is polled. 0 disables the
+         check entirely. Novelty is tracked per game (update_dismissed_ts), so
+         no global snapshot state is needed here. -->
+    <key name="updates-check-interval" type="i">
+      <default>12</default>
+    </key>
+    <!-- How often (in hours) the same feed is polled for readable posts, which
+         drives the "Novidades" badge. Kept separate from the key above on
+         purpose: turning per-game update checks off should not also silence the
+         news page. 0 disables the background poll; the page still fetches when
+         it is opened. -->
+    <key name="news-check-interval" type="i">
+      <default>6</default>
+    </key>
+    <!-- Mostrar o botão Novidades na barra superior. Oculto, o feed também não
+         é consultado. -->
+    <key name="show-news-button" type="b">
+      <default>false</default>
+    </key>
+    <!-- Onde ficam os backups dos saves dos jogos. Vazio quer dizer a pasta
+         padrão, dentro dos dados do app; qualquer outro valor é o caminho
+         escolhido pelo usuário. -->
+    <key name="pasta-dos-saves" type="s">
+      <default>""</default>
+    </key>
+    <!-- Nome e idioma do jogador aplicados aos .ini dos emuladores de Steam de
+         cada jogo. Vazio quer dizer "não alterar". -->
+    <key name="nome-do-jogador" type="s">
+      <default>""</default>
+    </key>
+    <key name="idioma-do-jogador" type="s">
+      <default>""</default>
+    </key>
+    <!-- A varredura única dos .ini dos jogos já existentes foi feita. -->
+    <key name="inis-varridos" type="b">
+      <default>false</default>
+    </key>
+    <!-- O aviso de atualizações foi ligado, uma vez, nos jogos que já tinham .ini de emulador. -->
+    <key name="avisos-dos-inis-ligados" type="b">
+      <default>false</default>
+    </key>
+  </schema>
+
+  <schema id="@APP_ID@.State" path="@PREFIX@/State/">
+    <key name="width" type="i">
+      <default>1170</default>
+    </key>
+    <key name="height" type="i">
+      <default>795</default>
+    </key>
+    <key name="is-maximized" type="b">
+      <default>false</default>
+    </key>
+    <!-- Where the window's frame was, so it reopens on the monitor it was
+         closed on. GTK4 has no window-position API, so these are read and
+         applied through Win32; see kyron/utils/window_geometry.py.
+         -2147483648 means "nothing stored yet" - 0 and -1 are both real
+         coordinates on a desktop whose second monitor sits above the first. -->
+    <key name="x" type="i">
+      <default>-2147483648</default>
+    </key>
+    <key name="y" type="i">
+      <default>-2147483648</default>
+    </key>
+    <key name="sort-mode" type="s">
+      <choices>
+        <choice value="a-z" />
+        <choice value="z-a" />
+        <choice value="newest" />
+        <choice value="oldest" />
+        <choice value="last_played" />
+        <choice value="playtime" />
+        <choice value="rating" />
+        <choice value="install_size" />
+        <choice value="released_newest" />
+        <choice value="released_oldest" />
+      </choices>
+      <default>"last_played"</default>
+    </key>
+    <key name="steam-limiter-tokens-history" type="s">
+      <default>"[]"</default>
+    </key>
+    <!-- pubDate (epoch seconds) of the newest feed post the user has already
+         been shown on the Novidades page. Anything newer lights the header-bar
+         badge. Stored as int64 because it is a timestamp. -->
+    <key name="news-last-seen-ts" type="x">
+      <default>0</default>
+    </key>
+    <!-- Tamanho, em pixels, em que o usuário deixou a caixa do "Onde eu parei"
+         (a da tela do jogo e a da tela de sessão compartilham). O mínimo é o
+         tamanho de sempre, 320x120. -->
+    <key name="notas-largura" type="i">
+      <default>320</default>
+    </key>
+    <key name="notas-altura" type="i">
+      <default>120</default>
+    </key>
+    <!-- Quando (epoch seconds) começou a última varredura de conquistas da
+         abertura que leu os arquivos de todos os jogos até o fim. Num jogo da
+         Steam, conquista com data anterior a isso não conta como nova no aviso:
+         chegou de outro aparelho. 0 = nenhuma ainda. -->
+    <key name="conquistas-ultima-varredura" type="x">
+      <default>0</default>
+    </key>
+    <!-- A última conta Steam (o número da pasta de userdata) que o ActiveUser
+         do registro trouxe, para ler as conquistas certas com a Steam fechada.
+         Vazio = a Steam nunca esteve aberta numa leitura; valem todas as contas.
+         Nunca sai do loginusers.vdf: ler esse arquivo faz o antivírus tomar o
+         app por ladrão de conta Steam (conquistas/arquivos.py). -->
+    <key name="conquistas-ultima-conta-steam" type="s">
+      <default>""</default>
+    </key>
+  </schema>
+</schemalist>

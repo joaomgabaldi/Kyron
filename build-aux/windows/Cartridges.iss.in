@@ -1,0 +1,344 @@
+; ISCC /DRepo=... /DPastaApp=...: empacota a pasta que o montar_app_qt.py montou.
+; Com /DDESENVOLVIMENTO: uma cópia que convive com a instalada (outro AppId e outra pasta) e usa só os dados "-dev".
+#ifndef Repo
+#error Passe /DRepo=<raiz do repositório> e /DPastaApp=<pasta que o montar_app_qt.py montou>.
+#endif
+#ifndef PastaApp
+#error Passe /DRepo=<raiz do repositório> e /DPastaApp=<pasta que o montar_app_qt.py montou>.
+#endif
+#ifdef DESENVOLVIMENTO
+#define MyAppName "Kyron (desenvolvimento)"
+#else
+#define MyAppName "Kyron"
+#endif
+#define MyAppVersion "@VERSION@"
+#define MyAppPublisher "joaomgabaldi"
+#define MyAppURL "https://github.com/joaomgabaldi/Kyron"
+#define MyAppExeName "Kyron.exe"
+
+[Setup]
+#ifdef DESENVOLVIMENTO
+AppId={{3C2D6B0E-5F71-4A8B-9E24-7D1A0C9B6F35}
+#else
+AppId={{88FC7AF8-9F74-40EC-AAED-FA6356261CBB}
+#endif
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+; Sem a versão: ela já tem coluna própria em "Aplicativos instalados", e o nome do app é só "Kyron".
+AppVerName={#MyAppName}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppURL}
+AppUpdatesURL={#MyAppURL}
+AppCopyright=Copyright © 2026 {#MyAppPublisher}. Licenciado sob a GPL-3.0-or-later.
+VersionInfoVersion={#MyAppVersion}
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoDescription=Instalador do {#MyAppName}
+VersionInfoOriginalFileName=Kyron Windows.exe
+#ifdef DESENVOLVIMENTO
+DefaultDirName={autopf64}\Kyron (desenvolvimento)
+#else
+DefaultDirName={autopf64}\Kyron
+#endif
+DisableProgramGroupPage=yes
+LicenseFile={#Repo}\LICENSE
+; Sempre como administrador: a pasta fica em Program Files.
+PrivilegesRequired=admin
+UsedUserAreasWarning=no
+#ifdef DESENVOLVIMENTO
+OutputBaseFilename=Kyron desenvolvimento
+#else
+OutputBaseFilename=Kyron Windows
+#endif
+SetupIconFile={#Repo}\build-aux\windows\icon.ico
+Compression=lzma
+SolidCompression=yes
+WizardStyle=modern
+; O Qt 6 exige o Windows 10 1809 (build 17763) ou mais novo; o README promete o mesmo.
+MinVersion=10.0.17763
+
+[Languages]
+Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
+
+; A tradução padrão é informal ("pra", "Aonde") e repete frases entre os três textos de cada página.
+; As mensagens ficam aqui, e não no .isl do Inno Setup, para uma atualização dele não desfazê-las.
+[Messages]
+brazilianportuguese.WelcomeLabel1=Bem-vindo ao instalador do [name]
+brazilianportuguese.WelcomeLabel2=O [name/ver] será instalado no seu computador.%n%nRecomendamos fechar os outros aplicativos antes de continuar.
+
+brazilianportuguese.WizardLicense=Acordo de licença
+brazilianportuguese.LicenseLabel=O [name] é software livre, distribuído sob a licença GPL-3.0.
+brazilianportuguese.LicenseLabel3=Leia o acordo abaixo. É preciso aceitá-lo para continuar.
+brazilianportuguese.LicenseAccepted=&Aceito o acordo
+brazilianportuguese.LicenseNotAccepted=&Não aceito o acordo
+
+brazilianportuguese.WizardSelectDir=Local de instalação
+brazilianportuguese.SelectDirDesc=Onde o [name] deve ser instalado?
+brazilianportuguese.SelectDirLabel3=O [name] será instalado na pasta abaixo.
+brazilianportuguese.SelectDirBrowseLabel=Clique em Avançar para continuar ou em Procurar para escolher outra pasta.
+brazilianportuguese.DiskSpaceGBLabel=São necessários pelo menos [gb] GB livres em disco.
+brazilianportuguese.DiskSpaceMBLabel=São necessários pelo menos [mb] MB livres em disco.
+
+brazilianportuguese.WizardSelectTasks=Tarefas adicionais
+brazilianportuguese.SelectTasksDesc=O que mais deve ser feito durante a instalação?
+brazilianportuguese.SelectTasksLabel2=Marque o que desejar e clique em Avançar.
+
+brazilianportuguese.WizardReady=Pronto para instalar
+brazilianportuguese.ReadyLabel1=Tudo pronto para instalar o [name] no seu computador.
+brazilianportuguese.ReadyLabel2a=Clique em Instalar para começar ou em Voltar para revisar as opções.
+brazilianportuguese.ReadyLabel2b=Clique em Instalar para começar.
+
+brazilianportuguese.WizardInstalling=Instalando
+brazilianportuguese.InstallingLabel=Aguarde enquanto o [name] é instalado.
+
+brazilianportuguese.FinishedHeadingLabel=Instalação concluída
+brazilianportuguese.FinishedLabel=O [name] foi instalado e já pode ser aberto pelos atalhos criados.
+brazilianportuguese.FinishedLabelNoIcons=O [name] foi instalado no seu computador.
+brazilianportuguese.ClickFinish=Clique em Concluir para sair.
+
+; Seção à parte: em [Messages] o Inno rejeitaria estes nomes como desconhecidos.
+[CustomMessages]
+brazilianportuguese.AdditionalIcons=Atalhos:
+brazilianportuguese.CreateDesktopIcon=Criar atalho na &área de trabalho
+brazilianportuguese.LaunchProgram=Iniciar o %1
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[InstallDelete]
+; Atualizar por cima deixaria em {app} o que saiu do app entre versões, e `.py` e `.pyc` (por hash)
+; precisam ser trocados juntos. No canal final saem também as pastas da versão anterior (GTK).
+; A biblioteca e as preferências ficam fora de {app}.
+#ifdef DESENVOLVIMENTO
+Type: filesandordirs; Name: "{app}\bin"
+Type: filesandordirs; Name: "{app}\python"
+Type: filesandordirs; Name: "{app}\lib"
+Type: filesandordirs; Name: "{app}\app"
+; Atalhos do nome anterior (Cartridges)
+Type: files; Name: "{autoprograms}\Cartridges Qt (desenvolvimento).lnk"
+Type: files; Name: "{autodesktop}\Cartridges Qt (desenvolvimento).lnk"
+#else
+Type: filesandordirs; Name: "{app}\bin"
+Type: filesandordirs; Name: "{app}\etc"
+Type: filesandordirs; Name: "{app}\lib"
+Type: filesandordirs; Name: "{app}\share"
+Type: filesandordirs; Name: "{app}\python"
+Type: filesandordirs; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\licencas"
+; Atalhos do nome anterior (Cartridges)
+Type: files; Name: "{autoprograms}\Cartridges.lnk"
+Type: files; Name: "{autodesktop}\Cartridges.lnk"
+#endif
+
+[Files]
+Source: "{#PastaApp}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "{#Repo}\build-aux\windows\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\bin\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\bin\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\bin\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall
+
+[Code]
+// Migração da instalação "só para mim" (%LOCALAPPDATA%\Programs) da versão anterior (GTK): o
+// instalador elevado não a enxerga e criaria uma segunda cópia. O desinstalador dela não serve:
+// pergunta se apaga a biblioteca, e numa atualização silenciosa ninguém responde. A limpeza
+// roda depois de a instalação nova dar certo e só apaga o que o instalador antigo criou, pois
+// a pasta pode ter outros arquivos da pessoa. A biblioteca e as configurações ficam fora dela.
+// Limite conhecido: com o UAC respondido por outra conta, o HKCU é o dela e a instalação
+// antiga não aparece; fica a cópia duplicada, sem perda de dados.
+const
+  ChaveDoUsuario = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{88FC7AF8-9F74-40EC-AAED-FA6356261CBB}_is1';
+
+function Normalizar(const Pasta: String): String;
+begin
+  Result := AddBackslash(Lowercase(Pasta));
+end;
+
+procedure ApagarAtalhoAntigo(const Atalho, PastaAntiga: String);
+var
+  Shell, Lnk: Variant;
+  Alvo: String;
+begin
+  if not FileExists(Atalho) then
+    Exit;
+  Shell := CreateOleObject('WScript.Shell');
+  Lnk := Shell.CreateShortcut(Atalho);
+  // Numa String antes do Lowercase, que espera uma String e não um Variant
+  Alvo := Lnk.TargetPath;
+  if Pos(PastaAntiga, Lowercase(Alvo)) = 1 then
+  begin
+    DeleteFile(Atalho);
+    Log('Migração: atalho apagado: ' + Atalho);
+  end
+  else
+    Log('Migração: atalho mantido (aponta para outro lugar): ' + Atalho);
+end;
+
+function ApagarItem(const Caminho: String): Boolean;
+begin
+  if DirExists(Caminho) then
+    Result := DelTree(Caminho, True, True, True)
+  else if FileExists(Caminho) then
+    Result := DeleteFile(Caminho)
+  else
+    Result := True;
+  if not Result then
+    Log('Migração: não foi possível apagar ' + Caminho);
+end;
+
+// O unins000.exe sai por último e só se todo o resto saiu: enquanto ele existir, a próxima
+// instalação tenta de novo.
+function ApagarInstalacaoAntiga(const Pasta: String): Boolean;
+begin
+  Result := ApagarItem(Pasta + 'bin');
+  Result := ApagarItem(Pasta + 'etc') and Result;
+  Result := ApagarItem(Pasta + 'lib') and Result;
+  Result := ApagarItem(Pasta + 'share') and Result;
+  Result := ApagarItem(Pasta + 'icon.ico') and Result;
+  Result := ApagarItem(Pasta + 'unins000.dat') and Result;
+  if Result then
+    Result := ApagarItem(Pasta + 'unins000.exe');
+  // RemoveDir só apaga pasta vazia: o que a pessoa guardou ali fica
+  RemoveDir(RemoveBackslash(Pasta));
+end;
+
+// Devolve a pasta antiga (normalizada) para CorrigirFixados; '' quando não há.
+function MigrarInstalacaoDoUsuario: String;
+var
+  Pasta, Dados, Destino: String;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKCU, ChaveDoUsuario, 'InstallLocation', Pasta) then
+    Exit;
+  Pasta := Normalizar(Pasta);
+  Dados := Normalizar(ExpandConstant('{localappdata}\io.github.joaomgabaldi.Cartridges'));
+  Destino := Normalizar(ExpandConstant('{app}'));
+  Log('Migração: instalação só para o usuário em ' + Pasta);
+  if not DirExists(Pasta) or not FileExists(Pasta + 'unins000.exe') then
+  begin
+    Log('Migração: pasta ausente ou sem unins000.exe; nada apagado');
+    Exit;
+  end;
+  if (Pos(Pasta, Destino) = 1) or (Pos(Destino, Pasta) = 1) or (Pos(Pasta, Dados) = 1) or (Pos(Dados, Pasta) = 1) then
+  begin
+    Log('Migração: a pasta contém ou está dentro do destino ou dos dados; nada apagado');
+    Exit;
+  end;
+  Result := Pasta;
+  try
+    ApagarAtalhoAntigo(ExpandConstant('{userprograms}\Cartridges.lnk'), Pasta);
+    ApagarAtalhoAntigo(ExpandConstant('{userdesktop}\Cartridges.lnk'), Pasta);
+    if ApagarInstalacaoAntiga(Pasta) then
+    begin
+      RegDeleteKeyIncludingSubkeys(HKCU, ChaveDoUsuario);
+      Log('Migração: instalação antiga removida');
+    end
+    else
+      Log('Migração: incompleta; a chave de desinstalação fica para a próxima tentativa');
+  except
+    Log('Migração interrompida: ' + GetExceptionMessage);
+  end;
+end;
+
+// Fixados na barra de tarefas que abrem o app pelo caminho da versão anterior (pythonw.exe ou
+// Cartridges.exe desta instalação, ou o exe da instalação "só para mim") passam a abrir o
+// Kyron.exe, e a janela volta a se agrupar com o fixado. Os do menu Iniciar ficam num arquivo
+// sem formato documentado e não são tocados.
+// O instalador é de 32 bits: nele o WScript.Shell lê "C:\Program Files" como "C:\Program Files
+// (x86)", então as duas formas valem. CreateShellLink grava o caminho certo.
+procedure CorrigirFixados(const PastaAntiga: String);
+var
+  Pasta, Alvo, Pythonw, PythonwX86, CartridgesExe, CartridgesExeX86, Pf64: String;
+  Busca: TFindRec;
+  Shell, Lnk: Variant;
+begin
+  Pasta := ExpandConstant('{userappdata}\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\');
+  Pythonw := Lowercase(ExpandConstant('{app}\bin\pythonw.exe'));
+  PythonwX86 := Pythonw;
+  CartridgesExe := Lowercase(ExpandConstant('{app}\bin\cartridges.exe'));
+  CartridgesExeX86 := CartridgesExe;
+  Pf64 := Normalizar(ExpandConstant('{commonpf64}'));
+  if Pos(Pf64, Pythonw) = 1 then
+  begin
+    PythonwX86 := Normalizar(ExpandConstant('{commonpf32}')) + Copy(Pythonw, Length(Pf64) + 1, Length(Pythonw));
+    CartridgesExeX86 := Normalizar(ExpandConstant('{commonpf32}')) + Copy(CartridgesExe, Length(Pf64) + 1, Length(CartridgesExe));
+  end;
+  if not FindFirst(Pasta + '*.lnk', Busca) then
+    Exit;
+  try
+    Shell := CreateOleObject('WScript.Shell');
+    repeat
+      // Um atalho com problema não impede os outros
+      try
+        Lnk := Shell.CreateShortcut(Pasta + Busca.Name);
+        Alvo := Lnk.TargetPath;
+        Alvo := Lowercase(Alvo);
+        if (Alvo = Pythonw) or (Alvo = PythonwX86) or (Alvo = CartridgesExe) or (Alvo = CartridgesExeX86) or ((PastaAntiga <> '') and (Pos(PastaAntiga, Alvo) = 1)) then
+        begin
+          CreateShellLink(Pasta + Busca.Name, '{#MyAppName}', ExpandConstant('{app}\bin\{#MyAppExeName}'),
+            '', ExpandConstant('{app}\bin'), ExpandConstant('{app}\icon.ico'), 0, SW_SHOWNORMAL);
+          Log('Fixado corrigido: ' + Busca.Name);
+        end;
+      except
+        Log('Fixado ' + Busca.Name + ': ' + GetExceptionMessage);
+      end;
+    until not FindNext(Busca);
+  except
+    Log('Fixados: ' + GetExceptionMessage);
+  end;
+  FindClose(Busca);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+#ifdef DESENVOLVIMENTO
+  // O [InstallDelete] também apaga o Cartridges.exe do desenvolvimento: sem isto o fixado quebra.
+  CorrigirFixados('');
+  Exit;
+#endif
+  CorrigirFixados(MigrarInstalacaoDoUsuario);
+end;
+
+// A biblioteca e as configurações ficam fora da pasta de instalação (LocalAppData e registro):
+// o desinstalador padrão as deixaria para trás.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Em silêncio não há quem responda: os dados ficam e nada trava à espera da pergunta.
+  if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
+  begin
+    // O compilador lê este arquivo como UTF-8 com ou sem BOM, então os acentos funcionam.
+    // A pasta dos saves só sai se for a padrão (dentro de {localappdata}); uma
+    // pasta escolhida em Preferências fica onde está, e o texto diz isso.
+#ifdef DESENVOLVIMENTO
+    if MsgBox('Remover também a cópia de desenvolvimento dos dados (biblioteca, capas e ' +
+              'preferências do Kyron de desenvolvimento)? Os dados do Kyron ' +
+              'instalado normalmente não são afetados.',
+              mbConfirmation, MB_YESNO) = IDYES then
+#else
+    if MsgBox('Remover também a biblioteca do Kyron (lista de jogos, capas, ' +
+              'histórico de sessões e os backups dos saves dos jogos guardados na ' +
+              'pasta padrão) e as configurações? Os jogos instalados no ' +
+              'computador não serão afetados.',
+              mbConfirmation, MB_YESNO) = IDYES then
+#endif
+    begin
+      // Limite conhecido: numa instalacao para todos os usuarios o desinstalador
+      // roda elevado, e se o UAC for respondido com outra conta, {localappdata}
+      // e HKCU sao os dessa conta, nao os de quem usa o app.
+#ifdef DESENVOLVIMENTO
+      DelTree(ExpandConstant('{localappdata}\io.github.joaomgabaldi.Cartridges-dev'), True, True, True);
+      RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, 'Software\GSettings\io\github\joaomgabaldi\Cartridges-dev');
+#else
+      DelTree(ExpandConstant('{localappdata}\io.github.joaomgabaldi.Cartridges'), True, True, True);
+      RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, 'Software\GSettings\io\github\joaomgabaldi\Cartridges');
+#endif
+      RegDeleteKeyIfEmpty(HKEY_CURRENT_USER, 'Software\GSettings\io\github\joaomgabaldi');
+      RegDeleteKeyIfEmpty(HKEY_CURRENT_USER, 'Software\GSettings\io\github');
+      RegDeleteKeyIfEmpty(HKEY_CURRENT_USER, 'Software\GSettings\io');
+    end;
+  end;
+end;

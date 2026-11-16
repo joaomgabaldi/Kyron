@@ -1,0 +1,487 @@
+"""O cartão do aviso de conquista."""
+
+import array
+import io
+import logging
+import wave
+import winsound
+from pathlib import Path
+
+import pytest
+from PySide6.QtGui import QWindow
+from kyron import conquista_aviso
+from kyron.conquistas import progresso
+from kyron.conquistas.catalogo import ConquistaInfo
+from kyron.conquistas.vigia import Desbloqueada
+
+
+_CRIAR_JANELA_REAL = conquista_aviso._criar_janela
+
+
+class JanelaFalsa:
+    """O contrato da janela do aviso (a de verdade, `JanelaDoAviso`): `titulo`, `entrar`, `sair`, `fechar`."""
+
+    falham: set = set()  # títulos cujo `entrar` levanta (a janela não pôde ser preparada)
+    entraram: list = []
+
+    def __init__(self, aviso):
+        self.titulo = aviso.titulo
+        self._destruida = False
+
+    def entrar(self, canto):
+        if self.titulo in JanelaFalsa.falham:
+            raise RuntimeError("a janela do aviso não pôde ser preparada")
+        JanelaFalsa.entraram.append(self.titulo)
+
+    def sair(self, ao_terminar):
+        ao_terminar()
+
+    def fechar(self):
+        self._destruida = True
+
+
+@pytest.fixture(autouse=True)
+def sem_efeitos(monkeypatch):
+    """Sem janela de verdade, saída sem animação e com o relógio na mão do teste."""
+    monkeypatch.setattr(conquista_aviso, "_som_escalado", None)  # o volume de um teste não vaza
+    monkeypatch.setattr(conquista_aviso, "_dados_do_som", None)
+    monkeypatch.setattr(JanelaFalsa, "falham", set())
+    monkeypatch.setattr(JanelaFalsa, "entraram", [])
+    monkeypatch.setattr(conquista_aviso, "_criar_janela", JanelaFalsa)
+    agendados = []
+    monkeypatch.setattr(
+        conquista_aviso, "_agendar", lambda segundos, funcao: agendados.append((segundos, funcao))
+    )
+    yield agendados
+    conquista_aviso.fechar()
+
+
+def _info(rara=False, porcentagem=50.0):
+    return ConquistaInfo("A", "Mestre da Grama", "Corte toda a grama.", "", "", False, 4.1 if rara else porcentagem)
+
+
+def test_porcentagem_em_texto():
+    assert progresso.porcentagem_em_texto(4.1) == "4,1%"
+    assert progresso.porcentagem_em_texto(55.0) == "55,0%"
+
+
+def test_aviso_comum():
+    aviso = conquista_aviso.Aviso.de(Desbloqueada("A", _info(), False))
+    assert aviso.rotulo == "Conquista desbloqueada"
+    assert (aviso.titulo, aviso.descricao) == ("Mestre da Grama", "Corte toda a grama.")
+
+
+def test_aviso_raro():
+    aviso = conquista_aviso.Aviso.de(Desbloqueada("A", _info(rara=True), False))
+    assert aviso.rotulo == "Conquista desbloqueada · ★ Rara, 4,1%"
+
+
+def test_aviso_que_completa_o_jogo():
+    aviso = conquista_aviso.Aviso.de(Desbloqueada("A", _info(rara=True), True))
+    assert aviso.rotulo == "Todas as conquistas desbloqueadas · ★ Rara, 4,1%"
+
+
+def test_sem_catalogo_nao_ha_aviso():
+    assert conquista_aviso.Aviso.de(Desbloqueada("A", None, False)) is None
+
+
+def test_avisos_entram_em_fila(sem_efeitos):
+    um = conquista_aviso.Aviso("Conquista desbloqueada", "Um", "", "")
+    dois = conquista_aviso.Aviso("Conquista desbloqueada", "Dois", "", "")
+    conquista_aviso.mostrar(um)
+    conquista_aviso.mostrar(dois)
+    assert conquista_aviso.na_tela() == "Um"
+    segundos, esconder = sem_efeitos[-1]
+    assert segundos == conquista_aviso.DURACAO
+    esconder()
+    assert conquista_aviso.na_tela() == "Dois"
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() is None
+
+
+def test_texto_nao_vira_markup(sem_efeitos):
+    conquista_aviso.mostrar(conquista_aviso.Aviso("Conquista desbloqueada", "A & <b>B</b>", "x < y", ""))
+    assert conquista_aviso.na_tela() == "A & <b>B</b>"
+
+
+def test_fechar_esvazia_a_fila(sem_efeitos):
+    conquista_aviso.mostrar(conquista_aviso.Aviso("r", "Um", "", ""))
+    conquista_aviso.mostrar(conquista_aviso.Aviso("r", "Dois", "", ""))
+    conquista_aviso.fechar()
+    assert conquista_aviso.na_tela() is None
+    sem_efeitos[-1][1]()  # o temporizador antigo dispara depois: não levanta nem mostra nada
+    assert conquista_aviso.na_tela() is None
+
+
+def test_exemplo():
+    exemplo = conquista_aviso.Aviso.exemplo()
+    assert exemplo.titulo and "★ Rara" in exemplo.rotulo
+
+
+def _aviso(titulo):
+    return conquista_aviso.Aviso("r", titulo, "", "")
+
+
+def test_falha_ao_mostrar_passa_para_o_proximo(monkeypatch, sem_efeitos):
+    """Um cartão que falha no meio da fila não trava a fila: o idle de recuperação
+    segue com o próximo, e um idle que sobra não duplica o que já está na tela."""
+    idle = []
+    monkeypatch.setattr(conquista_aviso, "na_thread_principal", lambda funcao, *args: idle.append(lambda: funcao(*args)))
+
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Dois"})
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    conquista_aviso.mostrar(_aviso("Tres"))
+    assert conquista_aviso.na_tela() == "Um"
+    sem_efeitos[-1][1]()  # o tempo de "Um" acaba: "Dois" falha com "Tres" ainda na fila
+    assert conquista_aviso.na_tela() is None
+    assert len(idle) == 1  # a recuperação ficou para fora desta chamada
+    conquista_aviso.mostrar(_aviso("Quatro"))  # chega antes do idle: mostra "Tres"
+    assert conquista_aviso.na_tela() == "Tres"
+    idle[0]()  # o idle roda tarde: não troca nem duplica o que está na tela
+    assert conquista_aviso.na_tela() == "Tres"
+    assert [a.titulo for a in conquista_aviso._fila] == ["Quatro"]
+
+
+def test_idle_de_recuperacao_mostra_o_proximo_quando_ninguem_chegou(monkeypatch, sem_efeitos):
+    idle = []
+    monkeypatch.setattr(conquista_aviso, "na_thread_principal", lambda funcao, *args: idle.append(lambda: funcao(*args)))
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Dois"})
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    conquista_aviso.mostrar(_aviso("Tres"))
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() is None and len(idle) == 1
+    idle[0]()
+    assert conquista_aviso.na_tela() == "Tres"
+
+
+def test_janela_que_nao_entra_nao_e_mostrada(monkeypatch, sem_efeitos):
+    """Sem os estilos o cartão tiraria o jogo da tela cheia: a janela que não pôde ser
+    preparada é descartada (e fechada), e a fila segue."""
+    criadas = []
+    original = JanelaFalsa.__init__
+
+    def espia(self, aviso):
+        original(self, aviso)
+        criadas.append(self)
+
+    monkeypatch.setattr(JanelaFalsa, "__init__", espia)
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Um"})
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert conquista_aviso.na_tela() is None
+    assert JanelaFalsa.entraram == [] and criadas[0]._destruida
+    conquista_aviso.mostrar(_aviso("Dois"))
+    assert conquista_aviso.na_tela() == "Dois"
+    assert JanelaFalsa.entraram == ["Dois"]
+
+
+def test_janela_que_nao_importa_nao_trava_a_fila(monkeypatch, sem_efeitos):
+    def sem_modulo(_aviso):
+        raise ImportError("kyron.janela_do_aviso")
+
+    monkeypatch.setattr(conquista_aviso, "_criar_janela", sem_modulo)
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert conquista_aviso.na_tela() is None
+    monkeypatch.setattr(conquista_aviso, "_criar_janela", JanelaFalsa)
+    conquista_aviso.mostrar(_aviso("Dois"))  # o próximo mostrar tenta de novo
+    assert conquista_aviso.na_tela() == "Dois"
+
+
+def test_saida_e_animada_e_o_proximo_so_entra_depois(monkeypatch, sem_efeitos):
+    saidas = []
+    monkeypatch.setattr(
+        JanelaFalsa, "sair", lambda self, ao_terminar: saidas.append(ao_terminar)
+    )
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    sem_efeitos[-1][1]()  # o tempo de "Um" acaba
+    assert conquista_aviso.na_tela() == "Um" and len(saidas) == 1  # saindo, ainda na tela
+    conquista_aviso.mostrar(_aviso("Tres"))  # chega durante a saída: só entra na fila
+    assert conquista_aviso.na_tela() == "Um"
+    saidas[0]()  # a animação de saída terminou
+    assert conquista_aviso.na_tela() == "Dois"
+    assert [a.titulo for a in conquista_aviso._fila] == ["Tres"]
+
+
+def test_temporizador_velho_nao_esconde_o_cartao_seguinte(sem_efeitos):
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    esconder_um = sem_efeitos[-1][1]
+    esconder_um()
+    assert conquista_aviso.na_tela() == "Dois"
+    esconder_um()  # o mesmo temporizador, de novo, já velho
+    assert conquista_aviso.na_tela() == "Dois"
+
+
+def test_fechar_durante_a_saida_fecha_na_hora(monkeypatch, sem_efeitos):
+    saidas = []
+    monkeypatch.setattr(
+        JanelaFalsa, "sair", lambda self, ao_terminar: saidas.append(ao_terminar)
+    )
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    sem_efeitos[-1][1]()
+    conquista_aviso.fechar()
+    assert conquista_aviso.na_tela() is None
+    saidas[0]()  # a animação "termina" depois do fim da sessão: nada acontece
+    assert conquista_aviso.na_tela() is None and not conquista_aviso._fila
+
+
+def test_animacao_que_nunca_termina_nao_trava_a_fila(monkeypatch, sem_efeitos):
+    saidas = []
+    monkeypatch.setattr(
+        JanelaFalsa, "sair", lambda self, ao_terminar: saidas.append(ao_terminar)
+    )
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    sem_efeitos[-1][1]()
+    segundos, forcar = sem_efeitos[-1]
+    assert segundos == conquista_aviso._LIMITE_DA_SAIDA
+    assert conquista_aviso.na_tela() == "Um"
+    forcar()
+    assert conquista_aviso.na_tela() == "Dois"
+    saidas[0]()  # e se a animação terminar depois, nada se repete
+    assert conquista_aviso.na_tela() == "Dois"
+
+
+def test_saida_que_falha_nao_trava_a_fila(monkeypatch, sem_efeitos):
+    def quebra(self, ao_terminar):
+        raise RuntimeError("falha de teste")
+
+    monkeypatch.setattr(JanelaFalsa, "sair", quebra)
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() == "Dois"
+
+
+def test_animacao_de_saida_de_verdade_termina_e_destroi(monkeypatch, sem_efeitos, user32_falso, flush_idle):  # noqa: ARG001
+    """A `JanelaDoAviso` de verdade (offscreen, user32 falso): a saída animada termina sozinha e o próximo entra."""
+    monkeypatch.setattr(conquista_aviso, "_criar_janela", _CRIAR_JANELA_REAL)
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    janela = conquista_aviso._atual
+    assert conquista_aviso.na_tela() == "Um"
+    sem_efeitos[-1][1]()  # o tempo do aviso acabou; o limite da saída fica na lista, sem rodar
+    for _ in range(100):
+        if conquista_aviso.na_tela() == "Dois":
+            break
+        flush_idle(0.05)
+    assert conquista_aviso.na_tela() == "Dois"
+    assert janela._destruida
+
+
+def test_limite_da_saida_vence_antes_do_terminou(monkeypatch, sem_efeitos, user32_falso, flush_idle):  # noqa: ARG001
+    """A `JanelaDoAviso` real sem quadros: o `_LIMITE_DA_SAIDA` fecha o aviso, o `ao_terminar` roda uma vez e um
+    `terminou` que chega depois não avança a fila de novo."""
+    monkeypatch.setattr(conquista_aviso, "_criar_janela", _CRIAR_JANELA_REAL)
+    saidas = []
+    saiu = conquista_aviso._saiu
+    monkeypatch.setattr(conquista_aviso, "_saiu", lambda vez, janela: saidas.append(janela) or saiu(vez, janela))
+    for titulo in ("Um", "Dois", "Três"):
+        conquista_aviso.mostrar(_aviso(titulo))
+    janela = conquista_aviso._atual
+    sem_efeitos[-1][1]()  # o tempo do aviso acabou: a saída começa e o limite fica agendado
+    assert sem_efeitos[-1][0] == conquista_aviso._LIMITE_DA_SAIDA
+    sem_efeitos[-1][1]()  # o limite vence antes de a animação terminar
+    assert conquista_aviso.na_tela() == "Dois"
+    assert janela._destruida and not QWindow.isVisible(janela)
+    assert saidas == [janela]
+    janela._terminou()  # o `terminou` tardio da animação de "Um"
+    flush_idle(0.5)
+    assert saidas == [janela]
+    assert conquista_aviso.na_tela() == "Dois"
+
+
+def test_cartao_do_aviso_e_o_mesmo_componente(monkeypatch, user32_falso):  # noqa: ARG001
+    """A janela mostra o `CartaoDoAviso.qml` registrado no módulo, o mesmo que o assistente e as Preferências usam."""
+    from kyron.janela_do_aviso import JanelaDoAviso  # noqa: PLC0415
+
+    qml = Path(conquista_aviso.__file__).parent / "qml"
+    assert "CartaoDoAviso 1.0 CartaoDoAviso.qml" in (qml / "qmldir").read_text(encoding="utf-8").splitlines()
+    janela = JanelaDoAviso(conquista_aviso.Aviso("Rótulo", "Título", "Descrição", ""))
+    try:
+        assert Path(janela.source().toLocalFile()) == qml / "CartaoDoAviso.qml"
+        cartao = janela.rootObject()
+        assert cartao.objectName() == "cartaoDoAviso"
+        assert [cartao.property(nome) for nome in ("rotulo", "titulo", "descricao", "icone")] == [
+            "Rótulo", "Título", "Descrição", ""
+        ]
+    finally:
+        janela.fechar()
+
+
+# O som
+
+
+@pytest.fixture
+def sons(monkeypatch, sem_som):
+    """A thread do som roda na hora, para o teste ver o que tocou."""
+    monkeypatch.setattr(conquista_aviso, "_em_segundo_plano", lambda funcao, *args: funcao(*args))
+    return sem_som
+
+
+def test_som_toca_quando_o_cartao_entra(sons):
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert len(sons) == 1
+    dados, flags = sons[0]
+    assert dados[:4] == b"RIFF" and dados[8:12] == b"WAVE"
+    assert flags == winsound.SND_MEMORY | winsound.SND_NODEFAULT  # falha não vira o "ding" do Windows
+
+
+def test_som_desligado_nao_toca(sons, schema):
+    schema.set_boolean("conquistas-aviso-som", False)
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert sons == []
+    assert conquista_aviso.na_tela() == "Um"
+
+
+def test_so_o_primeiro_cartao_da_fila_toca(sons, sem_efeitos):
+    for titulo in ("Um", "Dois", "Tres"):
+        conquista_aviso.mostrar(_aviso(titulo))
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() == "Dois"
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() == "Tres"
+    assert len(sons) == 1
+
+
+def test_conquista_depois_da_fila_vazia_toca_de_novo(sons, sem_efeitos):
+    conquista_aviso.mostrar(_aviso("Um"))
+    sem_efeitos[-1][1]()
+    assert conquista_aviso.na_tela() is None
+    conquista_aviso.mostrar(_aviso("Dois"))
+    assert len(sons) == 2
+
+
+def test_cartao_que_falha_no_meio_da_fila_nao_faz_o_seguinte_tocar(sons, sem_efeitos, monkeypatch):
+    idle = []
+    monkeypatch.setattr(
+        conquista_aviso, "na_thread_principal", lambda funcao, *args: idle.append((funcao, args))
+    )
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Um"})
+    for titulo in ("Zero", "Um", "Dois"):
+        conquista_aviso.mostrar(_aviso(titulo))
+    sem_efeitos[-1][1]()  # "Zero" sai; "Um" falha e a recuperação fica para o idle
+    funcao, args = idle.pop()
+    funcao(*args)
+    assert conquista_aviso.na_tela() == "Dois"
+    assert len(sons) == 1
+
+
+def test_primeiro_que_falha_nao_cala_a_conquista_seguinte(sons, monkeypatch):
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Um"})
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    assert conquista_aviso.na_tela() == "Dois"
+    assert len(sons) == 1
+
+
+def test_exemplo_toca_mesmo_com_fila(sons, sem_efeitos):
+    conquista_aviso.mostrar(_aviso("Um"))
+    conquista_aviso.mostrar(_aviso("Dois"))
+    conquista_aviso.fechar()
+    conquista_aviso.mostrar(conquista_aviso.Aviso.exemplo())
+    assert len(sons) == 2
+
+
+def test_cartao_que_nao_entra_nao_toca(sons, monkeypatch):
+    monkeypatch.setattr(JanelaFalsa, "falham", {"Um"})
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert conquista_aviso.na_tela() is None
+    assert sons == []
+
+
+def test_falha_do_som_nao_impede_o_cartao(sons, monkeypatch, caplog):
+    def sem_audio(_dados, _flags):
+        raise RuntimeError("Failed to play sound")
+
+    monkeypatch.setattr(winsound, "PlaySound", sem_audio)
+    with caplog.at_level(logging.WARNING):
+        conquista_aviso.mostrar(_aviso("Um"))
+    assert conquista_aviso.na_tela() == "Um"
+    assert any("som" in r.getMessage() for r in caplog.records)
+
+
+def test_som_vem_do_arquivo_de_dados(sons, schema, monkeypatch, tmp_path):
+    arquivo = tmp_path / "conquista.wav"
+    arquivo.write_bytes(_wav([1000, -1000]))
+    monkeypatch.setattr(conquista_aviso, "_ARQUIVO_DO_SOM", arquivo)
+    schema.set_int("conquistas-aviso-som-volume", 100)
+    conquista_aviso.mostrar(_aviso("Um"))
+    assert sons[0][0] == arquivo.read_bytes()
+    assert conquista_aviso._ARQUIVO_DO_SOM.name == "conquista.wav"
+
+
+def test_o_arquivo_de_som_do_app_existe():
+    real = Path(conquista_aviso.__file__).resolve().parent.parent / "data" / "sons" / "conquista.wav"
+    assert real.is_file()
+
+
+def test_sem_o_arquivo_de_som_o_aviso_aparece(sons, monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(conquista_aviso, "_ARQUIVO_DO_SOM", tmp_path / "nao_existe.wav")
+    with caplog.at_level(logging.WARNING):
+        conquista_aviso.mostrar(_aviso("Um"))
+    assert conquista_aviso.na_tela() == "Um"
+    assert sons == []
+    assert any("som" in r.getMessage() for r in caplog.records)
+
+
+# O volume
+
+
+def _wav(amostras, canais=2, largura=2, taxa=48000):
+    saida = io.BytesIO()
+    with wave.open(saida, "wb") as arquivo:
+        arquivo.setnchannels(canais)
+        arquivo.setsampwidth(largura)
+        arquivo.setframerate(taxa)
+        arquivo.writeframes(array.array("h", amostras).tobytes() if largura == 2 else bytes(amostras))
+    return saida.getvalue()
+
+
+def _amostras(dados):
+    with wave.open(io.BytesIO(dados)) as arquivo:
+        return (
+            arquivo.getnchannels(),
+            arquivo.getframerate(),
+            arquivo.getnframes(),
+            list(array.array("h", arquivo.readframes(arquivo.getnframes()))),
+        )
+
+
+def test_volume_pela_metade():
+    escalado = conquista_aviso._no_volume(_wav([1000, -1000, 3, 0]), 50)
+    assert _amostras(escalado) == (2, 48000, 2, [500, -500, 2, 0])
+
+
+def test_volume_cheio_devolve_o_original():
+    dados = _wav([1000, -1000])
+    assert conquista_aviso._no_volume(dados, 100) is dados
+
+
+def test_amostra_no_extremo_cabe_em_16_bits():
+    assert _amostras(conquista_aviso._no_volume(_wav([-32768, 32767]), 10))[3] == [-3277, 3277]
+
+
+def test_wav_de_8_bits_toca_o_original(sons, caplog):
+    dados = _wav([128, 200], canais=1, largura=1)
+    with caplog.at_level(logging.WARNING):
+        conquista_aviso._reproduzir(dados, 50)
+    assert sons[-1][0] == dados
+    assert any("volume" in r.getMessage() for r in caplog.records)
+
+
+def test_volume_lido_a_cada_som(sons, schema, sem_efeitos):
+    maiores = []
+    for volume in (50, 100, 50):
+        schema.set_int("conquistas-aviso-som-volume", volume)
+        conquista_aviso.fechar()
+        conquista_aviso.mostrar(_aviso("Um"))
+        maiores.append(max(abs(a) for a in _amostras(sons[-1][0])[3]))
+    assert maiores[0] == maiores[2] < maiores[1]
+
+
+def test_exemplo_aceita_a_porcentagem():
+    assert conquista_aviso.Aviso.exemplo(2.3).rotulo == "Conquista desbloqueada · ★ Rara, 2,3%"

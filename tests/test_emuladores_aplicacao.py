@@ -1,0 +1,178 @@
+"""Idioma e nome do jogador por jogo: valores efetivos e gravação nos .ini."""
+
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from kyron.emuladores import aplicacao
+from kyron.jogo import Jogo
+
+
+def _jogo(**campos) -> Jogo:
+    dados = {"game_id": "shortcuts_1", "source": "shortcuts", "name": "J", "executable": "x.exe", "added": 0}
+    return Jogo({**dados, **campos})
+
+
+def _ini(pasta: Path, nome="steam_emu.ini", texto="[Settings]\nUserName=Velho\nLanguage=english\n") -> Path:
+    pasta.mkdir(parents=True, exist_ok=True)
+    caminho = pasta / nome
+    caminho.write_bytes(texto.encode("latin-1"))
+    return caminho
+
+
+def test_valores_padrao_do_kyron(schema):
+    schema.set_string("nome-do-jogador", "Ana")
+    schema.set_string("idioma-do-jogador", "german")
+    assert aplicacao.valores_para(_jogo()) == ("Ana", "german")
+
+
+def test_valores_do_jogo_mandam_no_padrao(schema):
+    schema.set_string("nome-do-jogador", "Ana")
+    schema.set_string("idioma-do-jogador", "german")
+    assert aplicacao.valores_para(_jogo(nome_proprio="Bia", idioma_proprio="french")) == ("Bia", "french")
+
+
+def test_valores_invalidos_viram_none(schema):
+    schema.set_string("nome-do-jogador", "Ação")
+    schema.set_string("idioma-do-jogador", "klingon")
+    assert aplicacao.valores_para(_jogo()) == (None, None)
+    assert aplicacao.valores_para(_jogo(nome_proprio="x" * 33)) == (None, None)
+
+
+def test_idioma_com_appid_exige_confirmacao_da_steam(schema):
+    schema.set_string("idioma-do-jogador", "german")
+    assert aplicacao.valores_para(_jogo(steam_appid="620")) == (None, None)  # idiomas_steam None
+    assert aplicacao.valores_para(_jogo(steam_appid="620", idiomas_steam=["french"])) == (None, None)
+    assert aplicacao.valores_para(_jogo(steam_appid="620", idiomas_steam=["german"])) == (None, "german")
+    assert aplicacao.valores_para(_jogo(idiomas_steam=["french"])) == (None, "german")  # sem appid grava
+
+
+def test_aplicar_grava_em_todos(schema, tmp_path):
+    schema.set_string("nome-do-jogador", "Ana")
+    schema.set_string("idioma-do-jogador", "german")
+    a, b = _ini(tmp_path / "a"), _ini(tmp_path / "b", "codex.ini")
+    assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(a), str(b)])) == aplicacao.APLICADO
+    for c in (a, b):
+        assert b"UserName=Ana" in c.read_bytes() and b"Language=german" in c.read_bytes()
+
+
+def test_aplicar_sem_busca_ou_com_arquivo_ausente_nao_grava(schema, tmp_path):
+    schema.set_string("nome-do-jogador", "Ana")
+    existente = _ini(tmp_path)
+    antes = existente.read_bytes()
+    assert aplicacao.aplicar_no_jogo(_jogo()) == aplicacao.FALTANDO
+    assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(existente), str(tmp_path / "sumiu.ini")])) == aplicacao.FALTANDO
+    # configs.user.ini do GSE numa pasta steam_settings que sumiu também falta
+    gse = tmp_path / "sumiu" / "steam_settings" / "configs.user.ini"
+    assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(existente), str(gse)])) == aplicacao.FALTANDO
+    assert existente.read_bytes() == antes
+
+
+def test_aplicar_sem_valores_nao_toca_o_disco(schema, tmp_path):
+    existente = _ini(tmp_path)
+    antes, mtime = existente.read_bytes(), existente.stat().st_mtime_ns
+    assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(existente)])) == aplicacao.APLICADO
+    assert (existente.read_bytes(), existente.stat().st_mtime_ns) == (antes, mtime)
+
+
+def test_aplicar_somente_leitura_nao_levanta(schema, tmp_path, caplog):
+    schema.set_string("nome-do-jogador", "Ana")
+    bloqueado, livre = _ini(tmp_path / "a"), _ini(tmp_path / "b")
+    original = bloqueado.read_bytes()
+    os.chmod(bloqueado, stat.S_IREAD)
+    try:
+        assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(bloqueado), str(livre)])) == aplicacao.FALHOU
+    finally:
+        os.chmod(bloqueado, stat.S_IWRITE | stat.S_IREAD)
+    assert b"UserName=Ana" in livre.read_bytes()
+    assert bloqueado.read_bytes() == original
+    assert [r.levelname for r in caplog.records].count("WARNING") == 1
+
+
+def test_modelo_do_language_changer_com_marcador_so_muda_o_nome(schema, tmp_path):
+    schema.set_string("nome-do-jogador", "Ana")
+    schema.set_string("idioma-do-jogador", "german")
+    (tmp_path / "language.changer.ini").write_text("LanguageFileTemplate=steam_emu_\n")
+    modelo = _ini(tmp_path, "steam_emu_x.ini", "[Settings]\nUserName=Velho\nLanguage=&LANG&\n")
+    aplicacao.aplicar_no_jogo(_jogo(inis=[str(modelo)]))
+    dados = modelo.read_bytes()
+    assert b"UserName=Ana" in dados and b"Language=&LANG&" in dados
+
+
+def test_atualizar_inis_grava_lista_e_devolve_appid(tmp_path):
+    exe = tmp_path / "Jogo" / "x.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"MZ")
+    ini_ = _ini(exe.parent, texto="[Settings]\nAppId=620\n")
+    jogo = _jogo(executable=str(exe))
+    assert aplicacao.atualizar_inis(jogo, []) == "620"
+    assert jogo.inis == [str(ini_)]
+    jogo.executable = str(tmp_path / "Raiz" / "x.exe")  # pasta com outro jogo: recusada
+    (tmp_path / "Raiz").mkdir()
+    (tmp_path / "Raiz" / "x.exe").write_bytes(b"MZ")
+    (tmp_path / "Raiz" / "y.exe").write_bytes(b"MZ")
+    assert aplicacao.atualizar_inis(jogo, [str(tmp_path / "Raiz" / "y.exe")]) is None and jogo.inis == []
+
+
+def test_achar_os_ini_liga_o_aviso_de_atualizacoes_so_na_primeira_vez(tmp_path):
+    exe = tmp_path / "Jogo" / "x.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"MZ")
+    jogo = _jogo(executable=str(exe))
+    aplicacao.atualizar_inis(jogo, [])
+    assert jogo.track_updates is False, "sem .ini não é emulador"
+    _ini(exe.parent, texto="[Settings]\nAppId=620\n")
+    aplicacao.atualizar_inis(jogo, [])
+    assert jogo.track_updates is True
+    jogo.track_updates = False  # o usuário desligou: outra busca não religa
+    aplicacao.atualizar_inis(jogo, [])
+    assert jogo.track_updates is False
+    jogo.inis = None  # executável trocado: a lista esvazia, a escolha do usuário fica
+    aplicacao.atualizar_inis(jogo, [])
+    assert jogo.track_updates is False
+
+
+def test_atualizar_inis_sem_a_pasta_do_jogo_mantem_a_lista(tmp_path):
+    """HD externo desligado: o exe some, mas os .ini achados antes continuam valendo."""
+    jogo = _jogo(executable=str(tmp_path / "Desligado" / "x.exe"), inis=["E:/Jogo/steam_emu.ini"])
+    assert aplicacao.atualizar_inis(jogo, []) is None
+    assert jogo.inis == ["E:/Jogo/steam_emu.ini"]
+    jogo.executable = ""
+    assert aplicacao.atualizar_inis(jogo, []) is None and jogo.inis == ["E:/Jogo/steam_emu.ini"]
+
+
+def test_aplicar_cria_o_configs_user_ini_do_gse(schema, tmp_path):
+    schema.set_string("nome-do-jogador", "Ana")
+    gse = tmp_path / "steam_settings" / "configs.user.ini"
+    gse.parent.mkdir()
+    assert aplicacao.aplicar_no_jogo(_jogo(inis=[str(gse)])) == aplicacao.APLICADO
+    assert b"account_name=Ana" in gse.read_bytes()
+
+
+def test_adotar_appid(tmp_path):
+    jogo = _jogo(steam_appid="10", ludusavi_nome="X", saves_local_desconhecido_avisado=True)
+    jogo.idiomas_steam = ["german"]
+    assert aplicacao.adotar_appid(jogo, "620") is True
+    assert jogo.idiomas_steam is None
+    assert (jogo.steam_appid, jogo.ludusavi_nome, jogo.saves_local_desconhecido_avisado) == ("620", "", False)
+    assert aplicacao.adotar_appid(jogo, "620") is False
+    assert aplicacao.adotar_appid(jogo, None) is False
+    jogo.appid_manual = True
+    assert aplicacao.adotar_appid(jogo, "400") is False and jogo.steam_appid == "620"
+
+
+def test_valores_do_ini_pega_o_primeiro_de_cada_chave(tmp_path):
+    gse = tmp_path / "steam_settings" / "configs.user.ini"
+    gse.parent.mkdir()
+    gse.write_bytes(b"[user::general]\naccount_name=joaomgabaldi\n")
+    rune = tmp_path / "steam_emu.ini"
+    rune.write_bytes(b"[Settings]\r\nUserName=outro\r\nLanguage=Brazilian\r\n")
+    codex = tmp_path / "codex.ini"
+    codex.write_bytes(b"[Settings]\r\nLanguage=klingon\r\n")  # desconhecido: o próximo arquivo vale
+    modelo = tmp_path / "steam_emu_t.ini"
+    modelo.write_bytes(b"[Settings]\r\nLanguage=&LANG&\r\n")
+    inis = [str(modelo), str(gse), str(codex), str(rune)]
+    assert aplicacao.valores_do_ini(inis) == ("brazilian", "joaomgabaldi")
+    assert aplicacao.valores_do_ini(None) == ("", "")

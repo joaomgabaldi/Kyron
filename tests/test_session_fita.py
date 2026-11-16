@@ -1,0 +1,2767 @@
+# test_session_fita.py
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""As fitas de LED: o que fica em disco, qual cor cada jogo recebe, e quem
+chama o ciclo — o arranque do app, a sessão e o fechamento."""
+
+import json
+import sys
+import threading
+import time
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from kyron import shared
+from kyron.utils import session_fita
+from tests.apoio_fita import (  # noqa: F401
+    AVISO,
+    BATIMENTO,
+    CONSULTA,
+    FitaFalsa,
+    Msg,
+    cor_mandada,
+    estado_mandado,
+    falsas,
+    pastas,
+    sem_fade,
+    sem_vigia,
+)
+
+# O conftest troca `_dispositivo` por um que levanta; um teste usa o de verdade, com a tinytuya falsa.
+_dispositivo_de_verdade = session_fita._dispositivo
+
+
+def test_sem_configuracao_nao_ha_fitas():
+    assert session_fita.fitas() == []
+
+
+def test_fitas_gravadas_voltam_iguais():
+    uma = session_fita.Fita("Centro", "eb00", "192.168.0.150", "chave", "3.3")
+    session_fita.gravar_fitas([uma])
+    assert session_fita.fitas() == [uma]
+
+
+def test_arquivo_corrompido_nao_levanta():
+    shared.fitas_arquivo.write_text("{lixo", encoding="utf-8")
+    assert session_fita.fitas() == []
+
+
+def test_cor_do_jogo_sai_da_capa(tmp_path, schema):
+    cor = session_fita.cor_do_jogo(_jogo(tmp_path))
+    assert cor.matiz < 10 or cor.matiz > 350
+    assert cor.brilho == schema.get_int("fita-brilho-padrao")
+
+
+def test_escolha_manual_vence_a_capa(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_cor(jogo.game_id, jogo.name, session_fita.Cor(340, 1000, 150))
+    cor = session_fita.cor_do_jogo(jogo)
+    assert cor == session_fita.Cor(340, 1000, 150)
+    assert session_fita.escolhida(jogo.game_id)
+
+
+def test_redefinir_devolve_o_automatico(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_cor(jogo.game_id, jogo.name, session_fita.Cor(340, 1000, 150))
+    session_fita.redefinir(jogo.game_id)
+    assert not session_fita.escolhida(jogo.game_id)
+    assert session_fita.cor_do_jogo(jogo).matiz != 340
+
+
+def test_cor_escolhida_le_o_sidecar():
+    session_fita.salvar_cor("jogo1", "Jogo", session_fita.Cor(200, 500, 800))
+    cor = session_fita.cor_escolhida("jogo1")
+    assert cor == session_fita.Cor(200, 500, 800)
+
+
+def test_cor_escolhida_sem_escolha_e_none():
+    assert session_fita.cor_escolhida("sem-nada") is None
+
+
+def test_jogo_sem_capa_usa_a_cor_do_app(tmp_path, schema):
+    jogo = SimpleNamespace(game_id="sem-capa", name="X", get_cover_path=lambda: None)
+    cor = session_fita.cor_do_jogo(jogo)
+    assert (cor.matiz, cor.saturacao) == session_fita.COR_PADRAO_DO_APP
+
+
+def test_salvar_cor_nao_levanta_sem_permissao(tmp_path, monkeypatch, schema):
+    """Quem chama está na thread de UI: disco negado é aviso, nunca exceção."""
+    jogo = _jogo(tmp_path)
+
+    def negar(*_args, **_kwargs):
+        raise PermissionError("pasta negada")
+
+    monkeypatch.setattr(Path, "mkdir", negar)
+    cor = session_fita.Cor(340, 1000, 150)
+    assert session_fita.salvar_cor(jogo.game_id, jogo.name, cor) is None
+    assert not session_fita.escolhida(jogo.game_id)
+
+
+def test_redefinir_nao_levanta_quando_o_unlink_falha(tmp_path, monkeypatch, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_cor(jogo.game_id, jogo.name, session_fita.Cor(340, 1000, 150))
+
+    def negar(*_args, **_kwargs):
+        raise OSError("arquivo em uso")
+
+    monkeypatch.setattr(Path, "unlink", negar)
+    assert session_fita.redefinir(jogo.game_id) is None
+
+
+def test_sidecar_corrompido_volta_para_a_capa(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    shared.fitas_dir.mkdir(parents=True, exist_ok=True)
+    (shared.fitas_dir / f"{jogo.game_id}.json").write_text("{lixo", encoding="utf-8")
+    assert not session_fita.escolhida(jogo.game_id)
+    cor = session_fita.cor_do_jogo(jogo)
+    assert cor.matiz < 10 or cor.matiz > 350
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def test_cor_vai_e_volta_entre_o_seletor_e_o_modulo():
+    """O seletor do editor (QML) e o do módulo falam em RGB de 0 a 1."""
+    original = session_fita.Cor(340, 1000, 150)
+    vermelho, verde, azul = session_fita.cor_para_rgb(original)
+    # A cor cheia: o brilho da fita não escurece o quadradinho.
+    assert max(vermelho, verde, azul) == pytest.approx(1.0)
+
+    volta = session_fita.rgb_para_cor(vermelho, verde, azul, 150)
+    assert abs(volta.matiz - original.matiz) <= 2
+    assert abs(volta.saturacao - original.saturacao) <= 10
+    assert volta.brilho == 150
+
+
+def test_cinza_volta_sem_saturacao_e_vermelho_fecha_o_circulo():
+    assert session_fita.rgb_para_cor(0.5, 0.5, 0.5, 100) == session_fita.Cor(0, 0, 100)
+    assert session_fita.rgb_para_cor(1, 0, 0, 100).matiz == 0
+    assert session_fita.cor_para_rgb(session_fita.Cor(0, 1000, 1)) == (1.0, 0.0, 0.0)
+
+
+def test_cor_vira_hexadecimal_do_jeito_do_modulo():
+    assert session_fita.hsv_hex(session_fita.Cor(340, 1000, 150)) == "015403e80096"
+
+
+def test_hexadecimal_volta_a_ser_cor():
+    assert session_fita.cor_de_hex("015403e80096") == session_fita.Cor(340, 1000, 150)
+
+
+def test_hexadecimal_estranho_vira_nada():
+    assert session_fita.cor_de_hex("nao-e-hex") is None
+
+
+def test_ler_estado_traz_ligada_e_cor(falsas):
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+    assert session_fita.ler_estado(fita) == {"ligada": False, "cor": "000003e800b4"}
+    assert modulos
+
+
+def test_ler_estado_de_fita_fora_do_ar_e_nada(falsas):
+    falsas(True)
+    assert session_fita.ler_estado(session_fita.fitas()[0]) is None
+
+
+def test_aplicar_liga_poe_modo_cor_e_manda_a_cor(falsas):
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+    assert session_fita.aplicar(fita, True, "015403e80096") is True
+    # A ordem é o que importa aqui: a cor tem de chegar ANTES do liga, senão a
+    # fita acende na cor de ontem, no brilho de ontem, e só depois obedece.
+    assert modulos[fita.id].recebidos == [
+        {"21": "colour", "24": "015403e80096"},
+        {"20": True},
+    ]
+
+
+def test_aplicar_sem_cor_manda_so_o_liga_desliga(falsas):
+    """Fita apagada às vezes não reporta a cor, e o estado sai com ela vazia.
+
+    Mandar ``24: ""`` faz o módulo recusar o comando inteiro — e aí a fita não
+    apaga, que é justamente o que a devolução do fechamento promete.
+    """
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+
+    assert session_fita.aplicar(fita, False, "") is True
+    assert modulos[fita.id].recebidos == [{"20": False}]
+
+
+def test_aplicar_em_fita_fora_do_ar_devolve_falso(falsas):
+    falsas(True)
+    assert session_fita.aplicar(session_fita.fitas()[0], True, "015403e80096") is False
+
+
+def test_dispositivo_nao_insiste_com_fita_muda(monkeypatch):
+    """O único teste que passa pelo ``_dispositivo`` de verdade.
+
+    Prende o que a fita fora da tomada custa: sem cortar as retentativas, o
+    fechamento do app — que é síncrono — esperaria dezenas de segundos por um
+    módulo que não vai responder.
+    """
+    recebidos = {}
+
+    class BulbFalso:
+        def __init__(self, *args, **kwargs):
+            recebidos["args"] = args
+            recebidos["kwargs"] = kwargs
+
+        def set_socketTimeout(self, segundos):
+            recebidos["espera"] = segundos
+
+    falso = ModuleType("tinytuya")
+    falso.BulbDevice = BulbFalso
+    monkeypatch.setitem(sys.modules, "tinytuya", falso)
+
+    fita = session_fita.Fita("Centro", "eb00", "192.168.0.150", "chave", "3.3")
+    assert isinstance(_dispositivo_de_verdade(fita), BulbFalso)
+
+    assert recebidos["args"] == (fita.id, fita.ip, fita.key)
+    assert recebidos["kwargs"] == {
+        "version": 3.3,
+        "persist": True,
+        "connection_retry_limit": 1,
+        "connection_retry_delay": 0,
+    }
+    assert recebidos["espera"] == session_fita.ESPERA
+
+
+def test_varredura_vira_mapa_de_id_para_ip():
+    achados = {
+        "192.168.0.150": {"gwId": "eb0", "version": "3.3"},
+        "192.168.0.195": {"gwId": "eb1", "version": "3.3"},
+        "192.168.0.99": {"sem_id": True},
+    }
+    assert session_fita.ips_da_varredura(achados) == {
+        "eb0": "192.168.0.150",
+        "eb1": "192.168.0.195",
+    }
+
+
+def _tinytuya_que_varre(monkeypatch, resposta):
+    """Põe no lugar da ``tinytuya`` um módulo cujo ``deviceScan`` é anotado.
+
+    ``resposta`` é o que a varredura devolve, ou a exceção que ela levanta.
+    """
+    chamadas = []
+
+    def varrer(*args, **kwargs):
+        chamadas.append((args, kwargs))
+        if isinstance(resposta, Exception):
+            raise resposta
+        return resposta
+
+    falso = ModuleType("tinytuya")
+    falso.deviceScan = varrer
+    monkeypatch.setitem(sys.modules, "tinytuya", falso)
+    return chamadas
+
+
+def test_abrir_guarda_o_estado_e_veste_o_roxo(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, False)
+    session_fita._guardar_e_vestir()
+
+    guardado = json.loads(schema.get_string("fita-estado-anterior"))
+    assert set(guardado) == {"eb0", "eb1"}
+    assert guardado["eb0"] == {"ligada": False, "cor": "000003e800b4"}
+
+    for modulo in modulos.values():
+        assert estado_mandado(modulo) is True
+        assert session_fita.cor_de_hex(cor_mandada(modulo))[:2] == session_fita.COR_PADRAO_DO_APP
+
+
+def test_devolver_repoe_o_estado_e_limpa_a_chave(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    session_fita._guardar_e_vestir()
+    session_fita._devolver()
+
+    assert schema.get_string("fita-estado-anterior") == ""
+    assert estado_mandado(modulos["eb0"]) is False
+    # O desliga antes da cor de antes: junto, ela acenderia nela por um instante.
+    assert modulos["eb0"].recebidos[-2:] == [
+        {"20": False},
+        {"21": "colour", "24": "000003e800b4"},
+    ]
+
+
+def test_fita_fora_do_ar_nao_derruba_as_outras(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, True)
+    session_fita._guardar_e_vestir()
+
+    assert list(json.loads(schema.get_string("fita-estado-anterior"))) == ["eb0"]
+    assert modulos["eb0"].recebidos
+
+
+def test_orfaos_desfazem_a_sessao_que_ficou(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    schema.set_string(
+        "fita-estado-anterior",
+        json.dumps({"eb0": {"ligada": True, "cor": "00b403e80064"}}),
+    )
+    session_fita.restaurar_orfaos()
+
+    assert schema.get_string("fita-estado-anterior") == ""
+    assert cor_mandada(modulos["eb0"]) == "00b403e80064"
+
+
+def test_sem_fita_configurada_o_recurso_nao_age(schema):
+    schema.set_boolean("session-fita", True)
+    assert session_fita.ligada() is False
+    session_fita._guardar_e_vestir()
+    assert schema.get_string("fita-estado-anterior") == ""
+
+
+def test_desligado_nas_preferencias_nao_age(falsas, schema):
+    schema.set_boolean("session-fita", False)
+    falsas(False)
+    assert session_fita.ligada() is False
+
+
+def test_abrir_nao_faz_rede_na_thread_de_ui(falsas, monkeypatch, schema):
+    """``abrir`` só agenda: os dois passos do arranque são rede pura.
+
+    Com a thread capturada em vez de iniciada, ``abrir`` volta sem ter mandado
+    comando nenhum e sem ter tocado na chave.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+
+    session_fita.abrir()
+    assert modulos["eb0"].recebidos == []
+    assert schema.get_string("fita-estado-anterior") == ""
+
+    tarefas[0]()
+    assert modulos["eb0"].recebidos
+    assert json.loads(schema.get_string("fita-estado-anterior"))
+
+
+def test_arrancar_desfaz_o_orfao_antes_de_guardar_o_novo(falsas, schema):
+    """A ordem importa: desfazer primeiro, guardar depois.
+
+    Invertida, o roxo que o próprio app pintou viraria "o estado de antes" do
+    usuário, e o fechamento devolveria as fitas ao roxo para sempre.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    orfao = {"eb0": {"ligada": True, "cor": "00b403e80064"}}
+    schema.set_string("fita-estado-anterior", json.dumps(orfao))
+
+    session_fita._arrancar()
+
+    roxo = session_fita.hsv_hex(session_fita.cor_do_app())
+    # Só as cores, na ordem: a do órfão primeiro, a do app depois. Os comandos
+    # de liga/desliga entram no meio, porque acender manda a cor antes do liga.
+    cores = [c["24"] for c in modulos["eb0"].recebidos if "24" in c]
+    assert cores == ["00b403e80064", roxo]
+
+    guardado = json.loads(schema.get_string("fita-estado-anterior"))
+    assert guardado == orfao
+    assert guardado["eb0"]["cor"] != roxo
+
+
+def test_trava_ignora_o_arranque_que_chegou_junto(falsas, schema):
+    """Dois ``do_activate`` próximos não podem ler a chave ao mesmo tempo."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+
+    assert session_fita._TRAVA_ARRANQUE.acquire(blocking=False)
+    try:
+        assert session_fita._arrancar() is None
+    finally:
+        session_fita._TRAVA_ARRANQUE.release()
+
+    assert modulos["eb0"].recebidos == []
+    assert schema.get_string("fita-estado-anterior") == ""
+
+
+def test_desligado_nas_preferencias_ainda_desfaz_o_orfao(falsas, monkeypatch, schema):
+    """Quem desligou a opção no meio do caminho não fica com as fitas vestidas."""
+    schema.set_boolean("session-fita", False)
+    modulos = falsas(False)
+    schema.set_string(
+        "fita-estado-anterior",
+        json.dumps({"eb0": {"ligada": True, "cor": "00b403e80064"}}),
+    )
+
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    session_fita.abrir()
+    tarefas[0]()
+
+    assert schema.get_string("fita-estado-anterior") == ""
+    assert [c["24"] for c in modulos["eb0"].recebidos if "24" in c] == [
+        "00b403e80064"
+    ]
+
+
+def test_desligado_e_sem_orfao_o_arranque_nem_agenda(falsas, monkeypatch, schema):
+    schema.set_boolean("session-fita", False)
+    falsas(False)
+
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    assert session_fita.abrir() is None
+    assert tarefas == []
+
+
+def test_estado_adulterado_nao_levanta(falsas, schema):
+    """Chave mexida à mão não pode virar ``AttributeError`` cru."""
+    modulos = falsas(False, False)
+    schema.set_string(
+        "fita-estado-anterior",
+        json.dumps({"eb0": "roxo", "eb1": {"ligada": True, "cor": "00b403e80064"}}),
+    )
+
+    assert session_fita._devolver() is None
+    assert modulos["eb0"].recebidos == []
+    assert cor_mandada(modulos["eb1"]) == "00b403e80064"
+    assert schema.get_string("fita-estado-anterior") == ""
+
+
+def test_segunda_chamada_nao_repinta_o_estado_guardado(falsas, schema):
+    """O reacender das Preferências passa por aqui com a chave já gravada. Ela
+    não pode ser regravada aí: o estado a devolver é o primeiro, e não o roxo
+    que o próprio app pintou por cima.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    modulos["eb0"].dps = {"20": True, "21": "colour", "24": "00b403e80064"}
+
+    session_fita._guardar_e_vestir()
+    primeiro = schema.get_string("fita-estado-anterior")
+    assert json.loads(primeiro) == {"eb0": {"ligada": True, "cor": "00b403e80064"}}
+
+    # O próprio `_vestir` já deixou o módulo roxo: é exatamente esse estado
+    # errado que a segunda chamada gravaria se não houvesse a guarda.
+    assert modulos["eb0"].dps["24"] != "00b403e80064"
+
+    session_fita._guardar_e_vestir()
+    assert schema.get_string("fita-estado-anterior") == primeiro
+
+    session_fita._devolver()
+    assert estado_mandado(modulos["eb0"]) is True
+    assert cor_mandada(modulos["eb0"]) == "00b403e80064"
+
+
+def test_comecar_tira_a_cor_do_jogo_dentro_da_thread(
+    falsas, tmp_path, monkeypatch, schema
+):
+    """A cor do jogo é calculada na thread, e não antes dela.
+
+    Observável com a thread capturada em vez de iniciada: ``comecar`` volta sem
+    ter chamado ``cor_do_jogo`` nenhuma vez. Tirar a cor abre e quantiza a capa
+    em disco — I/O mais CPU, e isso não pode correr na thread de UI enquanto o
+    jogo abre. A cor sai certa quando a tarefa capturada roda.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    jogo = _jogo(tmp_path)
+    escolha = session_fita.Cor(340, 1000, 150)
+    session_fita.salvar_cor(jogo.game_id, jogo.name, escolha)
+    # Só a fita com estado de antes guardado é pintada.
+    schema.set_string(
+        session_fita.CHAVE_ESTADO, json.dumps({"eb0": {"ligada": False, "cor": ""}})
+    )
+
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    chamadas = []
+    de_verdade = session_fita.cor_do_jogo
+    monkeypatch.setattr(
+        session_fita,
+        "cor_do_jogo",
+        lambda game: (chamadas.append(game), de_verdade(game))[1],
+    )
+
+    session_fita.comecar(jogo)
+    assert chamadas == []
+
+    tarefas[0]()
+    assert chamadas == [jogo]
+    assert cor_mandada(modulos["eb0"]) == session_fita.hsv_hex(escolha)
+
+
+def test_fechar_nao_espera_alem_do_prazo(falsas, monkeypatch, schema):
+    """Fita muda não segura o fechamento do app.
+
+    A chave fica gravada de propósito quando o prazo estoura: é o
+    ``restaurar_orfaos`` do próximo arranque que termina o serviço.
+    """
+    schema.set_boolean("session-fita", True)
+    falsas(False)
+    session_fita._guardar_e_vestir()
+
+    monkeypatch.setattr(session_fita, "PRAZO_FECHAMENTO", 0.2)
+    preso = threading.Event()
+    monkeypatch.setattr(session_fita, "_devolver", preso.wait)
+
+    comeco = time.monotonic()
+    try:
+        assert session_fita.fechar() is None
+        gasto = time.monotonic() - comeco
+    finally:
+        preso.set()
+
+    assert gasto < 2
+    assert schema.get_string("fita-estado-anterior")
+
+
+# region As Preferências
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# endregion
+# region A fiação: quem chama o ciclo
+
+
+
+
+
+
+
+
+# endregion
+
+# region A cor na tela do jogo
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# endregion
+
+
+def test_as_fitas_mudam_de_cor_ao_mesmo_tempo(falsas, schema):
+    """Em fila, dá para ver a troca correndo de um monitor para o outro.
+
+    Três fitas de 0,15s levariam 0,45s uma depois da outra; juntas, pouco mais
+    que 0,15s. A margem é folgada de propósito, para a máquina ocupada não
+    derrubar o teste — o que ele prende é a ordem de grandeza, não o relógio.
+    """
+    schema.set_boolean("session-fita", True)
+    falsas(False, False, False, demora=0.15)
+
+    comeco = time.monotonic()
+    session_fita._vestir(session_fita.Cor(284, 620, 180))
+    gasto = time.monotonic() - comeco
+
+    # Acender manda dois comandos por fita (cor e depois liga), então o piso é
+    # 0,30s. Em fila seriam 0,90s.
+    assert gasto < 0.6
+
+
+def test_nunca_ha_duas_conversas_com_a_mesma_fita(falsas, schema):
+    """O módulo Tuya aceita uma sessão por vez; duas dão erro de soquete."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, False, demora=0.05)
+
+    linhas = [
+        threading.Thread(target=session_fita._vestir, args=(session_fita.cor_do_app(),))
+        for _ in range(4)
+    ]
+    for linha in linhas:
+        linha.start()
+    for linha in linhas:
+        linha.join()
+
+    for modulo in modulos.values():
+        assert modulo.pico == 1
+
+
+def test_o_brilho_vai_e_volta_entre_a_tela_e_o_modulo():
+    """A tela conta de 0 a 100; o módulo, de 0 a 1000."""
+    assert session_fita.por_cento(1000) == 100
+    assert session_fita.por_cento(180) == 18
+    assert session_fita.de_por_cento(18) == 180
+    assert session_fita.de_por_cento(100) == 1000
+
+
+def test_o_brilho_da_tela_nunca_apaga_a_fita():
+    """Zero por cento não pode virar fita apagada por acidente.
+
+    Apagar é o liga/desliga, não o brilho: uma cor com brilho zero é uma fita
+    que parece queimada, e não uma fita desligada.
+    """
+    assert session_fita.de_por_cento(0) == session_fita.BRILHO_MINIMO
+    assert session_fita.de_por_cento(-5) == session_fita.BRILHO_MINIMO
+    assert session_fita.de_por_cento(200) == session_fita.BRILHO_CHEIO
+
+
+def test_a_previa_engole_os_passos_do_meio(falsas, schema):
+    """Arrastar o controle gera dezenas de valores; a fita só precisa do último.
+
+    Sem isso, cada passo do controle viraria uma conversa de rede com as três
+    fitas e a fila só cresceria enquanto o dedo estivesse no controle.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, demora=0.05)
+
+    for por_cento in range(1, 40):
+        session_fita.previa(session_fita.Cor(284, 620, por_cento * 25))
+
+    # Espera a thread da prévia terminar o que pegou.
+    time.sleep(0.4)
+
+    cores = [comando for comando in modulos["eb0"].recebidos if "24" in comando]
+    assert 0 < len(cores) < 39
+    # A última cor pedida é a que fica valendo na fita.
+    assert cores[-1]["24"] == session_fita.hsv_hex(session_fita.Cor(284, 620, 975))
+
+
+def test_a_previa_nao_mexe_no_liga_desliga(falsas, schema):
+    """Prévia é cor, não interruptor: fita apagada continua apagada."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+
+    session_fita.previa(session_fita.Cor(284, 620, 180))
+    time.sleep(0.2)
+
+    assert all("20" not in comando for comando in modulos["eb0"].recebidos)
+
+
+def test_sem_fita_configurada_a_previa_nao_faz_nada(schema):
+    schema.set_boolean("session-fita", True)
+    session_fita.previa(session_fita.Cor(284, 620, 180))
+
+
+def test_a_conexao_aberta_e_reaproveitada(falsas, monkeypatch, schema):
+    """Abrir conexão custa ~225 ms; mandar pela aberta, ~11 ms."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    abertas = []
+    monkeypatch.setattr(
+        session_fita, "_dispositivo", lambda fita: abertas.append(fita.id) or modulos[fita.id]
+    )
+
+    session_fita._vestir(session_fita.cor_do_app())
+    session_fita._vestir(session_fita.Cor(120, 1000, 180))
+
+    assert abertas == ["eb0"]
+
+
+def test_conexao_que_morreu_em_silencio_e_refeita_na_hora(falsas, monkeypatch, schema):
+    """Roteador reiniciou ou o PC voltou da suspensão: o soquete guardado morreu.
+
+    O comando não pode se perder por isso — abre outra conexão e segue.
+    """
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+    session_fita.aplicar(fita, False, "")
+
+    modulos["eb0"].quebrada = True
+    novo = FitaFalsa()
+    monkeypatch.setattr(session_fita, "_dispositivo", lambda _fita: novo)
+
+    assert session_fita.aplicar(fita, True, "015403e80096") is True
+    assert cor_mandada(novo) == "015403e80096"
+    assert modulos["eb0"].fechada
+
+
+def test_tres_falhas_seguidas_suspendem_a_fita(falsas, schema):
+    """Fita fora da tomada para de custar o tempo de espera a cada troca."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(True)
+    fita = session_fita.fitas()[0]
+
+    for _ in range(session_fita.FALHAS_PARA_SUSPENDER):
+        assert session_fita.aplicar(fita, False, "") is False
+    assert fita.id in session_fita._suspensas
+
+    modulos["eb0"].quebrada = False
+    assert session_fita.aplicar(fita, False, "") is False
+    assert modulos["eb0"].recebidos == []
+
+
+def test_retomar_devolve_a_fita_suspensa(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(True)
+    fita = session_fita.fitas()[0]
+    for _ in range(session_fita.FALHAS_PARA_SUSPENDER):
+        session_fita.aplicar(fita, False, "")
+
+    modulos["eb0"].quebrada = False
+    session_fita.retomar()
+
+    assert session_fita.aplicar(fita, False, "") is True
+
+
+def test_uma_falha_solta_nao_suspende(falsas, schema):
+    """Um engasgo da rede no meio de respostas boas não conta como fita morta."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+
+    for _ in range(session_fita.FALHAS_PARA_SUSPENDER):
+        modulos["eb0"].quebrada = True
+        session_fita.aplicar(fita, False, "")
+        modulos["eb0"].quebrada = False
+        session_fita.aplicar(fita, False, "")
+
+    assert fita.id not in session_fita._suspensas
+
+
+def test_fechar_conexoes_fecha_todas(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, False)
+    session_fita._vestir(session_fita.cor_do_app())
+
+    session_fita.fechar_conexoes()
+
+    assert all(getattr(modulo, "fechada", False) for modulo in modulos.values())
+    assert session_fita._conexoes == {}
+
+
+class FitaComFila(FitaFalsa):
+    """Uma fita cuja consulta e batimento respondem como os de verdade numa
+    conexão que fica aberta: a tinytuya não confere se a resposta é do pedido
+    que ela fez, lê a mais antiga e, se vier vazia, lê mais uma."""
+
+    def __init__(self):
+        super().__init__()
+        self.sinais_de_vida = 0
+
+    def _responder(self, *mensagens):
+        # O que já estava a caminho chega antes da resposta deste pedido.
+        self.socket.chegar()
+        self.socket.fila += mensagens
+        mensagem = self.socket.fila.pop(0)
+        if mensagem.payload is None and self.socket.fila:
+            mensagem = self.socket.fila.pop(0)
+        return mensagem.payload
+
+    def heartbeat(self, nowait=True):
+        self.sinais_de_vida += 1
+        self.socket.fila.append(Msg(BATIMENTO))
+
+    def status(self, nowait=False):
+        self.sinais_de_vida += 1
+        if nowait:
+            return super().status(nowait=True)
+        return self._responder(Msg(CONSULTA, {"dps": dict(self.dps)}))
+
+    def close(self):
+        # Fechar com resposta por ler faz o Windows mandar RST, e a fita joga
+        # fora o último comando — medido: até 4 em 6 perdidos.
+        self.por_ler_ao_fechar = self.socket.fila + self.socket.a_caminho
+        super().close()
+
+
+@pytest.fixture
+def com_fila(monkeypatch, schema):
+    schema.set_boolean("session-fita", True)
+    fita = session_fita.Fita("Centro", "eb0", "1.2.3.4", "k")
+    session_fita.gravar_fitas([fita])
+    modulo = FitaComFila()
+    monkeypatch.setattr(session_fita, "_dispositivo", lambda _fita: modulo)
+    return fita, modulo
+
+
+def test_mensagem_que_ninguem_pediu_nao_vira_resposta(com_fila):
+    """Foi o "Testar" dizendo que as três fitas estavam fora do ar.
+
+    Uma mensagem antiga no soquete (a resposta de um batimento, ou a fita
+    avisando de uma troca feita pelo Smart Life) virava a resposta do comando
+    seguinte: a tinytuya lia ela e o "recebi" vazio, e devolvia nada.
+    """
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "015403e80096")
+    modulo.socket.fila.append(Msg(BATIMENTO))
+
+    assert session_fita.aplicar(fita, True, "011b026101f4") is True
+
+
+def test_batimento_nao_deixa_resposta_por_ler(com_fila, monkeypatch):
+    fita, modulo = com_fila
+    monkeypatch.setattr(session_fita, "BATIMENTO", 0.01)
+    session_fita.aplicar(fita, True, "015403e80096")
+
+    time.sleep(0.1)
+    assert modulo.sinais_de_vida > 1
+    assert fita.id in session_fita._conexoes
+    session_fita.fechar_conexoes()
+
+    assert modulo.por_ler_ao_fechar == []
+
+
+def test_fechamento_nao_deixa_resposta_por_ler(com_fila, schema):
+    """Resposta por ler no fechamento perdia a devolução de uma ou duas fitas."""
+    fita, modulo = com_fila
+    schema.set_string(
+        session_fita.CHAVE_ESTADO,
+        json.dumps({fita.id: {"ligada": True, "cor": "011b026101f4"}}),
+    )
+    session_fita.aplicar(fita, True, "015403e80096")
+    modulo.socket.fila.append(Msg(BATIMENTO))
+
+    session_fita.fechar()
+
+    assert cor_mandada(modulo) == "011b026101f4"
+    assert modulo.por_ler_ao_fechar == []
+
+
+def _cores_mandadas(modulo):
+    return [comando["24"] for comando in modulo.recebidos if "24" in comando]
+
+
+@pytest.fixture
+def com_fade(monkeypatch):
+    """Um fade curto: 10 degraus em 0,2 s."""
+    monkeypatch.setattr(session_fita, "DURACAO_FADE", 0.2)
+    monkeypatch.setattr(session_fita, "RITMO_FADE", 50)
+
+
+def test_degraus_vao_pelo_caminho_mais_curto():
+    """De 350° a 10° passa pelo vermelho (0°), e não dá a volta pelo verde."""
+    degraus = session_fita._degraus(
+        session_fita.Cor(350, 1000, 100), session_fita.Cor(10, 1000, 300), 4
+    )
+    cores = [session_fita.cor_de_hex(degrau) for degrau in degraus]
+    assert [cor.matiz for cor in cores] == [355, 0, 5, 10]
+    assert [cor.brilho for cor in cores] == [150, 200, 250, 300]
+
+
+def test_troca_de_cor_passa_pelas_cores_do_meio(com_fila, com_fade):
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+
+    session_fita._vestir(session_fita.Cor(120, 1000, 100))
+
+    cores = _cores_mandadas(modulo)
+    assert "003c03e80064" in cores  # 60°, o meio do caminho do vermelho ao verde
+    assert cores[-1] == "007803e80064"
+
+
+def test_estado_lido_serve_de_partida_para_o_fade(com_fila, com_fade):
+    """É o caso da abertura do app: lê a cor de antes e desliza dela."""
+    fita, modulo = com_fila
+    modulo.dps.update({"20": True, "24": "000003e80064"})
+    session_fita.ler_estado(fita)
+
+    session_fita._vestir(session_fita.Cor(120, 1000, 100))
+
+    assert "003c03e80064" in _cores_mandadas(modulo)
+
+
+def test_sem_saber_de_onde_a_fita_parte_nao_ha_fade(com_fila, com_fade):
+    """Sem ter lido nem mandado nada, o fade partiria de uma cor inventada."""
+    fita, modulo = com_fila
+
+    session_fita._vestir(session_fita.Cor(120, 1000, 100))
+
+    assert modulo.recebidos == [{"21": "colour", "24": "007803e80064"}, {"20": True}]
+
+
+def test_fita_apagada_acende_no_minimo_e_sobe(com_fila, com_fade):
+    """O espelho do fechamento: a fita liga já na cor de destino, no brilho
+    mínimo, e só com ela acesa e confirmada o brilho sobe. A primeira tentativa
+    de fade de entrada deixava a fita apagada no teste com as fitas de verdade;
+    a hipótese (ADR 0001) é que os degraus iam com ela ainda desligada."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, False, "000003e80064")
+    modulo.recebidos.clear()
+
+    session_fita._vestir(session_fita.Cor(120, 1000, 500))
+
+    minimo = session_fita.hsv_hex(session_fita.Cor(120, 1000, session_fita.BRILHO_MINIMO))
+    cor_no_minimo, liga, *degraus, cor_final, liga_final = modulo.recebidos
+    # Nenhum degrau antes do liga: o liga no mínimo vem primeiro, a cor antes.
+    assert cor_no_minimo == {"21": "colour", "24": minimo}
+    assert liga == {"20": True}
+    brilhos = [session_fita.cor_de_hex(degrau["24"]).brilho for degrau in degraus]
+    assert len(brilhos) > 1
+    assert brilhos == sorted(brilhos)
+    assert brilhos[-1] == 500
+    assert {session_fita.cor_de_hex(degrau["24"]).matiz for degrau in degraus} == {120}
+    assert cor_final == {"21": "colour", "24": "007803e801f4"}
+    assert liga_final == {"20": True}
+
+
+def test_fade_de_entrada_sobe_devagar_no_comeco_sem_encurtar(com_fila, com_fade, monkeypatch):
+    """O olho nota muito a diferença entre 1% e 10% e quase nada entre 60% e
+    100%: em linha reta, a fita parecia acesa em meio segundo e o resto do fade
+    passava despercebido. A curva segura o começo, e cada degrau leva o próprio
+    momento, para os repetidos que caem fora não encurtarem o fade."""
+    fita, _modulo = com_fila
+    session_fita.aplicar(fita, False, "000003e80064")
+    rajadas = []
+    monkeypatch.setattr(
+        session_fita, "_rajada", lambda _f, caminho, _g, momentos=None: rajadas.append((caminho, momentos))
+    )
+
+    session_fita._transitar(fita, True, session_fita.hsv_hex(session_fita.Cor(120, 1000, 1000)))
+
+    (caminho, momentos), = rajadas
+    duracao = session_fita.DURACAO_FADE
+    assert momentos is not None and len(momentos) == len(caminho)
+    assert momentos == sorted(momentos)
+    assert momentos[-1] == pytest.approx(duracao)
+    brilhos = [session_fita.cor_de_hex(cor).brilho for cor in caminho]
+    na_metade = max(b for b, m in zip(brilhos, momentos) if m <= duracao / 2)
+    # Em linha reta, na metade do tempo o brilho estaria em ~50%.
+    assert na_metade < 300
+    assert brilhos[-1] == 1000
+
+
+def test_fita_apagada_que_nao_liga_no_minimo_acende_direto(com_fila, com_fade, monkeypatch):
+    """Se o liga no mínimo não pega, nenhum degrau vai (degraus para uma fita
+    desligada podem ser o que a deixava apagada), mas a cor final ainda é
+    tentada: desistir deixaria a fita apagada, ou acesa a 1%."""
+    fita, _modulo = com_fila
+    session_fita.aplicar(fita, False, "000003e80064")
+    chamadas = []
+    rajadas = []
+    monkeypatch.setattr(
+        session_fita, "aplicar", lambda *args: chamadas.append(args[1:]) or False
+    )
+    monkeypatch.setattr(session_fita, "_rajada", lambda *args: rajadas.append(args))
+
+    session_fita._transitar(fita, True, "007803e801f4")
+
+    minimo = session_fita.hsv_hex(session_fita.Cor(120, 1000, session_fita.BRILHO_MINIMO))
+    assert chamadas == [(True, minimo), (True, "007803e801f4")]
+    assert rajadas == []
+
+
+def test_abertura_com_fita_apagada_acende_no_minimo(falsas, schema, com_fade):
+    """O caminho real da abertura chega ao fade de entrada: a leitura do estado
+    diz que a fita está apagada, e o primeiro liga é no brilho mínimo."""
+    schema.set_boolean("session-fita", True)
+    modulo = falsas(False)["eb0"]
+
+    session_fita._guardar_e_vestir()
+
+    cor, liga = modulo.recebidos[0], modulo.recebidos[1]
+    assert session_fita.cor_de_hex(cor["24"]).brilho == session_fita.BRILHO_MINIMO
+    assert liga == {"20": True}
+
+def test_apagar_desce_o_brilho_antes_de_desligar(com_fila, com_fade):
+    """O fechamento que devolve a fita apagada: ela escurece, e só então desliga."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e801f4")
+    modulo.recebidos.clear()
+
+    session_fita._repor(fita, {"ligada": False, "cor": "011b026101f4"})
+
+    *degraus, desliga, cor = modulo.recebidos
+    # O desliga antes da cor de antes: junto, a fita piscava nela ao apagar. E
+    # a cor vai depois, senão a fita guardaria o último degrau, a 1%.
+    assert desliga == {"20": False}
+    assert cor == {"21": "colour", "24": "011b026101f4"}
+    brilhos = [session_fita.cor_de_hex(degrau["24"]).brilho for degrau in degraus]
+    assert brilhos == sorted(brilhos, reverse=True)
+    assert brilhos[-1] == session_fita.BRILHO_MINIMO
+
+
+def test_troca_nova_interrompe_o_fade_em_curso(com_fila, monkeypatch):
+    """Play no meio do fade da abertura: a cor nova parte de onde a fita está."""
+    monkeypatch.setattr(session_fita, "DURACAO_FADE", 1)
+    monkeypatch.setattr(session_fita, "RITMO_FADE", 50)
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+
+    primeira = threading.Thread(
+        target=session_fita._vestir, args=(session_fita.Cor(120, 1000, 100),)
+    )
+    primeira.start()
+    time.sleep(0.2)
+    session_fita._vestir(session_fita.Cor(240, 1000, 100))
+    primeira.join()
+
+    assert _cores_mandadas(modulo)[-1] == "00f003e80064"
+    # A primeira nunca chegou ao fim: nem o último degrau, nem o comando final.
+    assert "007803e80064" not in _cores_mandadas(modulo)
+
+
+def test_fade_so_termina_quando_a_fita_para_de_responder(com_fila):
+    """Os degraus vão sem esperar resposta, e as respostas chegam depois.
+
+    Se o comando final saísse com elas ainda a caminho, leria uma delas como a
+    sua, e a dele sobraria no soquete: é o bug do fechamento que perdia a
+    devolução.
+    """
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+    session_fita._geracoes[fita.id] = 1
+
+    session_fita._rajada(fita, ["003c03e80064", "007803e80064"], 1)
+
+    assert modulo.socket.fila == []
+    assert modulo.socket.a_caminho == []
+
+
+def test_fade_sem_aviso_do_fim_segue_na_mesma_conexao(com_fila):
+    """A fita às vezes joga fora o fim da rajada. Quem garante a cor final é o
+    comando final, que é reenviado; trocar de conexão ali só punha uma
+    reconexão no pior momento."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+    session_fita._geracoes[fita.id] = 1
+    modulo.sem_aviso = True
+
+    session_fita._rajada(fita, ["003c03e80064"], 1)
+
+    assert not getattr(modulo, "fechada", False)
+    assert fita.id in session_fita._conexoes
+
+
+def test_comando_perdido_e_reenviado_na_mesma_conexao(com_fila):
+    """Medido: de vez em quando a fita joga fora um comando, sem aviso. O
+    mesmo comando reenviado pega."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+    modulo.recebidos.clear()
+    modulo.perder = 1
+
+    assert session_fita.aplicar(fita, False, "") is True
+    assert modulo.recebidos == [{"20": False}]
+    assert not getattr(modulo, "fechada", False)
+
+
+def test_aviso_repetido_de_outro_comando_nao_confirma_este(com_fila):
+    """Visto logo depois de um fade: a fita repetiu o aviso do último degrau
+    depois do comando seguinte. Lido como resposta, o aviso de verdade sobrava
+    no soquete — e fechar com ele por ler faz a fita jogar fora o comando."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+    modulo.socket.a_caminho.append(Msg(AVISO, {"dps": {"24": "000003e80064"}}))
+
+    assert session_fita.aplicar(fita, False, "") is True
+    assert modulo.socket.fila == []
+    assert modulo.socket.a_caminho == []
+
+
+def test_ler_estado_nao_confunde_aviso_com_estado(com_fila):
+    """No arranque com órfãos, a leitura vem logo depois da devolução, com a
+    segunda cópia do último aviso ainda a caminho. Lida como estado, a fita
+    acesa viraria "apagada" — e o fechamento a desligaria."""
+    fita, modulo = com_fila
+    modulo.dps.update({"20": True, "24": "000003e80064"})
+    session_fita.aplicar(fita, True, "000003e80064")
+    modulo.socket.a_caminho.append(Msg(AVISO, {"dps": {"24": "000003e80064"}}))
+
+    assert session_fita.ler_estado(fita) == {"ligada": True, "cor": "000003e80064"}
+
+
+def test_degraus_repetidos_viram_um_so():
+    """Fade de 50% a 50,2%: sem isso, o último degrau apareceria três vezes, e
+    o aviso do primeiro deles pareceria o do fim."""
+    degraus = session_fita._degraus(
+        session_fita.Cor(0, 1000, 500), session_fita.Cor(0, 1000, 502), 10
+    )
+    assert degraus == ["000003e801f5", "000003e801f6"]
+
+
+def test_previa_nao_faz_fade(com_fila, com_fade):
+    """O controle de brilho tem de acompanhar o dedo, e não correr atrás dele."""
+    fita, modulo = com_fila
+    session_fita.aplicar(fita, True, "000003e80064")
+    modulo.recebidos.clear()
+
+    session_fita._pintar_fita(fita, session_fita.Cor(120, 1000, 100))
+
+    assert modulo.recebidos == [{"21": "colour", "24": "007803e80064"}]
+
+
+def test_brilho_por_dispositivo_vale_sobre_o_geral(com_fila):
+    """Dispositivo em 50%: o brilho geral de 10% acende a 5%, e a prévia da
+    janela usa o valor que ainda não foi salvo."""
+    fita, modulo = com_fila
+    session_fita.gravar_fitas([fita._replace(brilho=50)])
+
+    fita = session_fita.fitas()[0]
+    session_fita._pintar_fita(fita, session_fita.Cor(120, 1000, 100))
+    session_fita._pintar_fita(fita, session_fita.Cor(120, 1000, 100), {"eb0": 20})
+    session_fita._pintar_fita(fita, session_fita.Cor(120, 1000, 10))
+
+    assert [recebido["24"] for recebido in modulo.recebidos] == [
+        "007803e80032",
+        "007803e80014",
+        "007803e8000a",  # nunca abaixo do mínimo que ainda acende
+    ]
+
+
+def test_brilho_por_dispositivo_ilegivel_vale_100():
+    shared.fitas_arquivo.write_text(
+        json.dumps({"fitas": [{"nome": "C", "id": "a", "ip": "1", "key": "k", "brilho": None}]}),
+        encoding="utf-8",
+    )
+    assert session_fita.fitas()[0].brilho == 100
+
+
+@pytest.mark.varredura_real
+def test_duas_varreduras_ao_mesmo_tempo_viram_uma(monkeypatch):
+    """Duas varreduras juntas brigam pelo mesmo soquete de broadcast.
+
+    No Windows isso volta como "apenas uma utilização de cada endereço de
+    soquete" — foi o erro visto no primeiro teste com as fitas de verdade.
+    """
+    dentro = []
+    pico = []
+
+    def varredura_lenta(*_args, **_kwargs):
+        dentro.append(1)
+        pico.append(len(dentro))
+        time.sleep(0.1)
+        dentro.pop()
+        return {}
+
+    falso = ModuleType("tinytuya")
+    falso.deviceScan = varredura_lenta
+    monkeypatch.setitem(sys.modules, "tinytuya", falso)
+
+    linhas = [threading.Thread(target=session_fita.enderecos_na_rede) for _ in range(3)]
+    for linha in linhas:
+        linha.start()
+    for linha in linhas:
+        linha.join()
+
+    assert max(pico) == 1
+
+
+@pytest.mark.varredura_real
+def test_varredura_que_falha_devolve_mapa_vazio(monkeypatch):
+    def explodir(*_args, **_kwargs):
+        raise OSError("rede fora")
+
+    falso = ModuleType("tinytuya")
+    falso.deviceScan = explodir
+    monkeypatch.setitem(sys.modules, "tinytuya", falso)
+
+    assert session_fita.enderecos_na_rede() == ({}, {})
+
+
+def test_fita_sem_endereco_nao_chega_a_abrir_conexao(monkeypatch, schema):
+    """Sem IP, a tinytuya varreria a rede sozinha ao abrir a conexão.
+
+    Com as fitas em paralelo, seriam varreduras simultâneas na mesma porta.
+    """
+    abertas = []
+    monkeypatch.setattr(session_fita, "_dispositivo", lambda fita: abertas.append(fita))
+    fita = session_fita.Fita("Centro", "eb0", "", "k")
+
+    assert session_fita.aplicar(fita, True, "015403e80096") is False
+    assert abertas == []
+    # Não é fita fora do ar: só ainda não foi achada. Não conta falha.
+    assert fita.id not in session_fita._falhas
+
+
+
+
+def test_a_cor_do_app_vem_de_fabrica_no_azul(schema):
+    assert session_fita.tom_do_app() == session_fita.COR_PADRAO_DO_APP
+
+
+def test_a_cor_escolhida_vira_a_cor_oficial_do_app(falsas, schema):
+    """Vermelho escolhido nas Preferências é o que acende com o app aberto."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    session_fita.salvar_tom_do_app(0, 1000)
+
+    session_fita._guardar_e_vestir()
+
+    cor = session_fita.cor_de_hex(cor_mandada(modulos["eb0"]))
+    assert (cor.matiz, cor.saturacao) == (0, 1000)
+
+
+def test_voltar_ao_padrao_desfaz_a_escolha(schema):
+    session_fita.salvar_tom_do_app(210, 800)
+    session_fita.redefinir_tom_do_app()
+    assert session_fita.tom_do_app() == session_fita.COR_PADRAO_DO_APP
+
+
+def test_jogo_sem_capa_usa_a_cor_escolhida_para_o_app(schema):
+    session_fita.salvar_tom_do_app(210, 800)
+    jogo = SimpleNamespace(game_id="sem-capa", name="X", get_cover_path=lambda: None)
+
+    cor = session_fita.cor_do_jogo(jogo)
+
+    assert (cor.matiz, cor.saturacao) == (210, 800)
+
+
+
+
+# region Pulso de conquista
+
+
+@pytest.fixture
+def fora_de_sessao(falsas, monkeypatch, schema):
+    """Uma fita falsa vestida na cor do app, sem sessão, com threads capturadas."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    schema.set_string(
+        session_fita.CHAVE_ESTADO, json.dumps({"eb0": {"ligada": True, "cor": ""}})
+    )
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    monkeypatch.setattr(
+        session_fita,
+        "ESTILOS_DO_PULSO",
+        {
+            estilo: {
+                tipo: [passo._replace(segura=0, desliza=0) for passo in passos]
+                for tipo, passos in tipos.items()
+            }
+            for estilo, tipos in session_fita.ESTILOS_DO_PULSO.items()
+        },
+    )
+    modulos["eb0"].recebidos.clear()
+    return SimpleNamespace(modulo=modulos["eb0"], tarefas=tarefas)
+
+
+@pytest.fixture
+def pulso(fora_de_sessao, tmp_path):
+    """A fita de ``fora_de_sessao`` numa sessão já vestida."""
+    jogo = _jogo(tmp_path)
+    session_fita.comecar(jogo)
+    fora_de_sessao.tarefas.pop(0)()  # veste a cor do jogo
+    # Abrir a conexão agendou o batimento na mesma captura. Ele roda em laço
+    # até o fim do processo: nunca pode ser executado aqui, e não pode sobrar
+    # na lista, onde o `tarefas.pop()` dos testes o tomaria pela volta do app.
+    fora_de_sessao.tarefas.clear()
+    fora_de_sessao.modulo.recebidos.clear()
+    return SimpleNamespace(
+        modulo=fora_de_sessao.modulo, tarefas=fora_de_sessao.tarefas, jogo=jogo
+    )
+
+
+def _cores(modulo):
+    return [comando["24"] for comando in modulo.recebidos if "24" in comando]
+
+
+def _ouro():
+    fita = session_fita.fitas()[0]
+    return session_fita.hsv_hex(session_fita.na_fita(session_fita.OURO, fita))
+
+
+def test_pulso_normal_vai_ao_ouro_e_volta(pulso):
+    session_fita.pulsar_conquista("normal")
+    assert len(pulso.tarefas) == 1
+    pulso.tarefas.pop(0)()
+    cores = _cores(pulso.modulo)
+    fita = session_fita.fitas()[0]
+    cor_do_jogo = session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.cor_do_jogo(pulso.jogo), fita)
+    )
+    assert cores[0] == _ouro()
+    assert cores[-1] == cor_do_jogo
+
+
+def test_pulso_raro_pisca_duas_vezes(pulso):
+    session_fita.pulsar_conquista("rara")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 2
+
+
+def test_completo_pisca_quatro_vezes(pulso):
+    session_fita.pulsar_conquista("completo")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 4
+
+
+def _pedir_durante_o_pulso(monkeypatch, *tipos):
+    """Pede estes tipos de pulso na primeira espera de um pulso em curso."""
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            for tipo in tipos:
+                session_fita.pulsar_conquista(tipo)
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+
+
+def test_pedidos_comuns_durante_um_pulso_sao_absorvidos(pulso, monkeypatch):
+    _pedir_durante_o_pulso(monkeypatch, "rara", "normal")
+    session_fita.pulsar_conquista("normal")
+    assert len(pulso.tarefas) == 1  # uma thread serve a fila
+    pulso.tarefas.pop(0)()
+    # Só o normal que tocava: a rajada é um pulso só.
+    assert _cores(pulso.modulo).count(_ouro()) == 1
+    assert session_fita._fila_de_pulsos == [] and session_fita._pulsando is False
+    assert len(pulso.tarefas) == 0
+
+
+def test_completo_durante_um_completo_e_absorvido(pulso, monkeypatch):
+    _pedir_durante_o_pulso(monkeypatch, "completo")
+    session_fita.pulsar_conquista("completo")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 4
+
+
+def test_pedido_antes_de_o_pulso_comecar_ainda_promove(pulso):
+    session_fita.pulsar_conquista("normal")
+    session_fita.pulsar_conquista("rara")  # a thread ainda não tirou o "normal" da fila
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 2
+
+
+def test_completo_esperando_nao_pulsa_depois_do_fim_da_sessao(pulso, monkeypatch):
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            session_fita.pulsar_conquista("completo")
+            session_fita.voltar()
+            pulso.tarefas.pop()()  # a volta à cor do app roda já
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 1
+    assert session_fita._tipo_em_curso is None
+
+
+def test_pedidos_durante_um_pulso_viram_um_so_do_tipo_mais_forte(pulso, monkeypatch):
+    _pedir_durante_o_pulso(monkeypatch, "rara", "normal", "completo", "rara")
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 1 + 4
+    assert session_fita._fila_de_pulsos == []
+    assert session_fita._pulsando is False
+
+
+def test_fim_da_sessao_interrompe_o_pulso(pulso, monkeypatch):
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            session_fita.voltar()
+            pulso.tarefas.pop()()  # a volta à cor do app roda já
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.pulsar_conquista("rara")
+    pulso.tarefas.pop(0)()
+    cores = _cores(pulso.modulo)
+    fita = session_fita.fitas()[0]
+    cor_do_app = session_fita.hsv_hex(session_fita.na_fita(session_fita.cor_do_app(), fita))
+    assert cores[-1] == cor_do_app
+    assert cores.count(_ouro()) == 1
+
+
+def test_fora_de_sessao_nao_pulsa(falsas, monkeypatch, schema):
+    schema.set_boolean("session-fita", True)
+    falsas(False)
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    session_fita.voltar()
+    tarefas.clear()
+    session_fita.pulsar_conquista("normal")
+    assert tarefas == []
+
+
+def test_recurso_desligado_nao_pulsa(pulso, schema):
+    schema.set_boolean("session-fita", False)
+    session_fita.pulsar_conquista("normal")
+    assert pulso.tarefas == []
+
+
+def test_todo_estilo_tem_os_tres_tipos():
+    """A fila compara por ``FORCA_DOS_PULSOS``: um tipo que faltasse num
+    estilo levantaria no meio do pulso."""
+    for tipos in session_fita.ESTILOS_DO_PULSO.values():
+        assert set(tipos) == set(session_fita.FORCA_DOS_PULSOS)
+
+
+def test_tipo_desconhecido_nao_pulsa(pulso):
+    session_fita.pulsar_conquista("lendaria")
+    assert pulso.tarefas == []
+
+
+def test_fita_que_nao_responde_nao_derruba_o_pulso(pulso):
+    pulso.modulo.quebrada = True
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()  # não levanta
+    assert _cores(pulso.modulo) == []
+
+
+def test_fechar_o_app_no_meio_do_pulso_devolve_o_estado_de_antes(pulso, monkeypatch, schema):
+    original = "000003e800b4"
+    schema.set_string(
+        session_fita.CHAVE_ESTADO, json.dumps({"eb0": {"ligada": True, "cor": original}})
+    )
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def em_linha(tarefa):
+        tarefa()
+        return SimpleNamespace(join=lambda prazo=None: None, is_alive=lambda: False)
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            # O app fecha sem passar por `voltar`.
+            monkeypatch.setattr(session_fita, "_em_thread", em_linha)
+            session_fita.fechar()
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.pulsar_conquista("rara")
+    pulso.tarefas.pop(0)()
+    cores = _cores(pulso.modulo)
+    assert cores[-1] == original
+    assert cores.count(_ouro()) == 1  # o dourado de antes do fechamento, nenhum depois
+
+
+def test_o_fim_da_sessao_entre_a_conferencia_e_a_vez_nao_deixa_o_ouro(pulso, monkeypatch):
+    """O fim da sessão tenta entrar logo depois de o pulso reservar a vez: só
+    entra depois, com a vez maior, e a fita termina na cor do app."""
+    reservar = session_fita._reservar
+    interrupcao = {}
+
+    def reservar_e_encerrar(alvos):
+        vezes = reservar(alvos)
+        if "linha" not in interrupcao:
+            interrupcao["linha"] = threading.Thread(target=session_fita.voltar)
+            interrupcao["linha"].start()
+            interrupcao["linha"].join(0.3)
+            interrupcao["bloqueada"] = interrupcao["linha"].is_alive()
+        return vezes
+
+    monkeypatch.setattr(session_fita, "_reservar", reservar_e_encerrar)
+    session_fita.pulsar_conquista("rara")
+    pulso.tarefas.pop(0)()
+    interrupcao["linha"].join()
+    # `voltar` esperou a conferência e a reserva do pulso terminarem.
+    assert interrupcao["bloqueada"]
+    pulso.tarefas.pop()()  # a volta à cor do app
+    fita = session_fita.fitas()[0]
+    cor_do_app = session_fita.hsv_hex(session_fita.na_fita(session_fita.cor_do_app(), fita))
+    assert _cores(pulso.modulo)[-1] == cor_do_app
+
+
+def test_falha_ao_criar_a_thread_nao_trava_os_pulsos_seguintes(pulso, monkeypatch):
+    def quebra(_tarefa):
+        raise RuntimeError("sem threads")
+
+    monkeypatch.setattr(session_fita, "_em_thread", quebra)
+    session_fita.pulsar_conquista("normal")  # não levanta
+    assert session_fita._pulsando is False
+    assert session_fita._fila_de_pulsos == []
+    monkeypatch.setattr(session_fita, "_em_thread", pulso.tarefas.append)
+    session_fita.pulsar_conquista("normal")
+    assert len(pulso.tarefas) == 1
+
+
+def test_recurso_desligado_no_meio_do_pulso_para_o_pulso(pulso, monkeypatch, schema):
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            schema.set_boolean("session-fita", False)
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.pulsar_conquista("rara")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 1
+    assert session_fita._pulsando is False
+
+
+def test_comando_que_falha_no_pulso_esquece_o_que_a_fita_mostra(pulso):
+    fita = session_fita.fitas()[0]
+    assert fita.id in session_fita._mostrada
+    vez = session_fita._reservar([fita])[fita.id]
+    pulso.modulo.quebrada = True
+    session_fita._tingir(fita, session_fita.OURO, vez)
+    assert fita.id not in session_fita._mostrada
+
+
+# O pulso de antes desta mudança, copiado: "Piscar" não pode mudar.
+_PULSOS_ANTIGOS = {
+    "normal": [("ouro", 1.5)],
+    "rara": [("ouro", 0.6), ("jogo", 0.5), ("ouro", 0.6)],
+    "completo": [
+        ("ouro", 0.5), ("jogo", 0.4), ("ouro", 0.5), ("jogo", 0.4),
+        ("ouro", 0.5), ("jogo", 0.4), ("ouro", 2.0),
+    ],
+}
+
+
+def test_piscar_e_o_pulso_de_sempre():
+    nomes = {"pulso": "ouro", "base": "jogo"}
+    for tipo, passos in session_fita.ESTILOS_DO_PULSO["piscar"].items():
+        assert [(nomes[p.alvo], p.segura) for p in passos] == _PULSOS_ANTIGOS[tipo]
+        assert all(p.desliza == 0 for p in passos)
+
+
+def test_piscar_rapido_nao_passa_de_dois_e_meio_por_segundo():
+    for passos in session_fita.ESTILOS_DO_PULSO["rapido"].values():
+        for acende, apaga in zip(passos[::2], passos[1::2]):
+            assert (acende.alvo, apaga.alvo) == ("pulso", "base")
+            assert acende.segura + acende.desliza + apaga.segura + apaga.desliza >= 0.4
+
+
+def test_todo_passo_dura_e_tem_alvo_conhecido():
+    for tipos in session_fita.ESTILOS_DO_PULSO.values():
+        for passos in tipos.values():
+            assert passos
+            for passo in passos:
+                assert passo.alvo in ("pulso", "base")
+                assert passo.segura >= 0 and passo.desliza >= 0
+                assert passo.segura + passo.desliza > 0
+
+
+def test_cor_do_pulso_padrao_e_o_ouro(schema):
+    assert session_fita.cor_do_pulso() == session_fita.OURO
+    assert session_fita.tom_do_pulso() == session_fita.TOM_DO_OURO
+
+
+def test_cor_do_pulso_salva_e_redefinida(schema):
+    session_fita.salvar_tom_do_pulso(400, 1500)
+    assert session_fita.tom_do_pulso() == (40, 1000)  # matiz no círculo, saturação no teto
+    assert session_fita.cor_do_pulso().brilho == session_fita.BRILHO_CHEIO
+    session_fita.redefinir_tom_do_pulso()
+    assert session_fita.tom_do_pulso() == session_fita.TOM_DO_OURO
+
+
+def test_estilo_desconhecido_vira_respirar(schema):
+    schema.set_string("conquistas-pulso-estilo", "discoteca")
+    assert session_fita.estilo_do_pulso() == "respirar"
+    schema.set_string("conquistas-pulso-estilo", "piscar")
+    assert session_fita.estilo_do_pulso() == "piscar"
+
+
+def test_pulso_usa_a_cor_escolhida(pulso, schema):
+    schema.set_int("conquistas-pulso-matiz", 200)
+    schema.set_int("conquistas-pulso-saturacao", 800)
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    fita = session_fita.fitas()[0]
+    escolhida = session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.Cor(200, 800, session_fita.BRILHO_CHEIO), fita)
+    )
+    assert _cores(pulso.modulo)[0] == escolhida
+    assert _ouro() not in _cores(pulso.modulo)
+
+
+def test_estilo_rapido_pisca_quatro_vezes_no_normal(pulso, schema):
+    schema.set_string("conquistas-pulso-estilo", "rapido")
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 4
+
+
+def test_estilo_longo_acende_uma_vez(pulso, schema):
+    schema.set_string("conquistas-pulso-estilo", "longo")
+    session_fita.pulsar_conquista("completo")
+    pulso.tarefas.pop(0)()
+    assert _cores(pulso.modulo).count(_ouro()) == 1
+
+
+def test_respirar_desliza_ate_o_pulso(pulso, schema, monkeypatch):
+    """Com deslize, a fita passa por cores do meio antes de chegar ao pulso."""
+    schema.set_string("conquistas-pulso-estilo", "respirar")
+    monkeypatch.setattr(
+        session_fita,
+        "ESTILOS_DO_PULSO",
+        {
+            "respirar": {
+                tipo: [session_fita.Passo("pulso", 0, 0.1), session_fita.Passo("base", 0, 0.1)]
+                for tipo in session_fita.FORCA_DOS_PULSOS
+            }
+        },
+    )
+    monkeypatch.setattr(session_fita, "RITMO_FADE", 30)  # 3 degraus por deslize de 0,1 s
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    cores = _cores(pulso.modulo)
+    fita = session_fita.fitas()[0]
+    cor_do_jogo = session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.cor_do_jogo(pulso.jogo), fita)
+    )
+    chegada = cores.index(_ouro())
+    assert chegada >= 2  # degraus do meio antes de chegar ao pulso
+    assert cor_do_jogo not in cores[:chegada]
+    assert cores[-1] == cor_do_jogo
+
+
+def _cor_do_app_na_fita():
+    fita = session_fita.fitas()[0]
+    return session_fita.hsv_hex(session_fita.na_fita(session_fita.cor_do_app(), fita))
+
+
+def test_teste_fora_de_sessao_vai_ao_pulso_e_volta_a_cor_do_app(fora_de_sessao):
+    session_fita.testar_pulso()
+    assert len(fora_de_sessao.tarefas) == 1
+    fora_de_sessao.tarefas.pop(0)()
+    cores = _cores(fora_de_sessao.modulo)
+    assert cores[0] == _ouro()
+    assert cores[-1] == _cor_do_app_na_fita()
+
+
+def test_teste_em_sessao_e_o_pulso_normal_do_jogo(pulso):
+    session_fita.testar_pulso()
+    pulso.tarefas.pop(0)()
+    fita = session_fita.fitas()[0]
+    cor_do_jogo = session_fita.hsv_hex(session_fita.na_fita(session_fita.cor_do_jogo(pulso.jogo), fita))
+    cores = _cores(pulso.modulo)
+    assert cores.count(_ouro()) == 1 and cores[-1] == cor_do_jogo
+
+
+def test_sessao_que_comeca_interrompe_o_teste(fora_de_sessao, monkeypatch, tmp_path):
+    jogo = _jogo(tmp_path)
+    dormir_de_verdade = session_fita.time.sleep
+    monkeypatch.setattr(
+        session_fita,
+        "ESTILOS_DO_PULSO",
+        {e: {t: [session_fita.Passo("pulso", 0), session_fita.Passo("base", 0), session_fita.Passo("pulso", 0)]
+             for t in session_fita.FORCA_DOS_PULSOS} for e in ("respirar",)},
+    )
+
+    def dormir(segundos):
+        if session_fita._jogo_da_sessao is None:
+            session_fita.comecar(jogo)  # a sessão começa no meio do teste
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.testar_pulso()
+    fora_de_sessao.tarefas.pop(0)()  # o teste: um passo e para
+    assert _cores(fora_de_sessao.modulo).count(_ouro()) == 1
+    assert session_fita._teste_do_pulso is None
+    # O que a sessão vestiu vem depois do teste: a fita termina na cor do jogo.
+    # A última tarefa é o vestir de `comecar`; a anterior é o batimento, que
+    # roda em laço e nunca pode ser executado aqui.
+    fora_de_sessao.tarefas.pop()()
+    fita = session_fita.fitas()[0]
+    cor_do_jogo = session_fita.hsv_hex(session_fita.na_fita(session_fita.cor_do_jogo(jogo), fita))
+    assert _cores(fora_de_sessao.modulo)[-1] == cor_do_jogo
+
+
+def test_fechar_interrompe_o_teste(fora_de_sessao, monkeypatch, schema):
+    original = "000003e800b4"
+    schema.set_string(
+        session_fita.CHAVE_ESTADO, json.dumps({"eb0": {"ligada": True, "cor": original}})
+    )
+    monkeypatch.setattr(
+        session_fita,
+        "ESTILOS_DO_PULSO",
+        {"respirar": {t: [session_fita.Passo("pulso", 0), session_fita.Passo("base", 0), session_fita.Passo("pulso", 0)]
+                    for t in session_fita.FORCA_DOS_PULSOS}},
+    )
+    dormir_de_verdade = session_fita.time.sleep
+
+    def em_linha(tarefa):
+        tarefa()
+        return SimpleNamespace(join=lambda prazo=None: None, is_alive=lambda: False)
+
+    chamadas = {"n": 0}
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            monkeypatch.setattr(session_fita, "_em_thread", em_linha)
+            session_fita.fechar()  # devolve o estado de antes, na hora
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.testar_pulso()
+    fora_de_sessao.tarefas.pop(0)()
+    cores = _cores(fora_de_sessao.modulo)
+    assert cores.count(_ouro()) == 1  # parou no primeiro passo
+    assert cores[-1] == original  # e a devolução não foi atropelada pelo pulso
+    assert session_fita._teste_do_pulso is None
+
+
+def test_clique_novo_toma_o_lugar_do_teste_anterior(fora_de_sessao):
+    session_fita.testar_pulso()
+    primeiro = session_fita._teste_do_pulso
+    session_fita.testar_pulso()
+    assert session_fita._teste_do_pulso is not primeiro
+    assert len(session_fita._fila_de_pulsos) == 1
+    assert len(fora_de_sessao.tarefas) == 1  # uma thread só serve a fila
+
+
+def test_teste_sem_fita_nao_faz_nada(schema, monkeypatch):
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    session_fita.testar_pulso()
+    assert tarefas == []
+
+
+# endregion
+
+
+def test_fita_que_nao_responde_nao_atrasa_a_previa_das_outras(monkeypatch, schema):
+    """O seletor de cor parecia não responder: cada clique esperava a fita fora
+    do ar desistir antes de pintar as outras."""
+    schema.set_boolean("session-fita", True)
+    session_fita.gravar_fitas(
+        [
+            session_fita.Fita("Abajur", "morta", "1.2.3.4", "k"),
+            session_fita.Fita("Centro", "viva", "1.2.3.5", "k"),
+        ]
+    )
+    solta = threading.Event()
+    pintadas = []
+
+    def pintar(fita, cor, *_resto):
+        if fita.id == "morta":
+            solta.wait(5)
+        else:
+            pintadas.append(cor.matiz)
+
+    monkeypatch.setattr(session_fita, "_pintar_fita", pintar)
+
+    def _esperar_que(condicao):
+        limite = time.monotonic() + 1
+        while not condicao() and time.monotonic() < limite:
+            time.sleep(0.01)
+        assert condicao()
+
+    try:
+        session_fita.previa(session_fita.Cor(10, 1000, 100))
+        _esperar_que(lambda: pintadas == [10])
+        session_fita.previa(session_fita.Cor(20, 1000, 100))
+        _esperar_que(lambda: pintadas == [10, 20])
+    finally:
+        solta.set()
+
+
+def test_conquista_da_sessao_nova_nao_e_engolida_pelo_pulso_velho(pulso, monkeypatch, tmp_path):
+    """O pulso da sessão que acabou ainda dorme num passo: a conquista da sessão
+    seguinte não pode ser absorvida por ele."""
+    novo = _jogo(tmp_path, game_id="jogo-2", cor=(20, 20, 220))
+    na_fila = []
+    chamadas = {"n": 0}
+    dormir_de_verdade = session_fita.time.sleep
+
+    def dormir(segundos):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            session_fita.voltar()
+            pulso.tarefas.pop()()  # a volta à cor do app
+            session_fita.comecar(novo)
+            pulso.tarefas.pop()()  # veste a cor do jogo novo
+            session_fita.pulsar_conquista("rara")
+            na_fila.extend(session_fita._fila_de_pulsos)
+        dormir_de_verdade(0)
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    session_fita.pulsar_conquista("normal")
+    pulso.tarefas.pop(0)()
+    assert na_fila == [(novo, "rara")]
+    assert _cores(pulso.modulo).count(_ouro()) == 1 + 2
+
+
+def test_esperar_para_quando_o_dono_perde_a_validade(pulso, monkeypatch):
+    fatias = []
+
+    def dormir(segundos):
+        fatias.append(segundos)
+        if len(fatias) == 2:
+            session_fita.voltar()
+
+    monkeypatch.setattr(session_fita.time, "sleep", dormir)
+    assert session_fita._esperar_o_passo(pulso.jogo, 5) is False
+    assert len(fatias) <= 3
+
+
+def test_esperar_ate_o_fim_com_o_dono_valido(pulso, monkeypatch):
+    fatias = []
+    monkeypatch.setattr(session_fita.time, "sleep", fatias.append)
+    assert session_fita._esperar_o_passo(pulso.jogo, 0.25) is True
+    assert abs(sum(fatias) - 0.25) < 1e-9 and max(fatias) <= 0.1
+
+
+# region Cor da tela
+
+from kyron.utils.tela_do_jogo import Amostra  # noqa: E402
+
+ATUAL = session_fita.Cor(100, 1000, 1000)
+TETO = 1000
+
+
+def _da_tela(matiz, saturacao, luz=1.0):
+    return Amostra("cor", (matiz, saturacao), luz)
+
+
+def test_saturacao_da_tela_e_reforcada_para_a_luz():
+    assert session_fita._saturacao_da_luz(250) == 850
+    assert session_fita._saturacao_da_luz(625) == 925
+    assert session_fita._saturacao_da_luz(1000) == 1000
+
+
+def test_brilho_acompanha_a_luz_da_cena():
+    assert session_fita._brilho_da_cena(0.0, TETO) == 400
+    assert session_fita._brilho_da_cena(0.175, TETO) == 700
+    assert session_fita._brilho_da_cena(0.35, TETO) == 1000
+    assert session_fita._brilho_da_cena(1.0, TETO) == 1000
+
+
+def test_brilho_da_cena_nunca_apaga_a_fita():
+    assert session_fita._brilho_da_cena(0.0, 18) == session_fita.BRILHO_MINIMO
+
+
+def test_matiz_perto_nao_troca():
+    assert session_fita._proxima_cor(ATUAL, _da_tela(110, 1000), TETO) is None
+
+
+def test_matiz_longe_troca():
+    assert session_fita._proxima_cor(ATUAL, _da_tela(130, 625), TETO) == session_fita.Cor(
+        130, 925, 1000
+    )
+
+
+def test_matiz_mede_pelo_lado_curto_do_circulo():
+    atual = session_fita.Cor(350, 800, 1000)
+    assert session_fita._proxima_cor(atual, _da_tela(5, 1000), TETO) is None
+
+
+def test_saturacao_da_tela_sozinha_nao_troca_a_luz():
+    """Com o piso em 850, a saturação da luz anda no máximo 150: o limiar de
+    250 nunca dispara só por ela."""
+    atual = session_fita.Cor(100, 1000, 1000)
+    assert session_fita._proxima_cor(atual, _da_tela(100, 250), TETO) is None
+
+
+def test_saturacao_perto_nao_troca():
+    assert session_fita._proxima_cor(ATUAL, _da_tela(100, 1000), TETO) is None
+
+
+def test_brilho_perto_nao_troca():
+    # Luz que dá 880: 12% do teto, abaixo dos 15% do limiar.
+    assert session_fita._proxima_cor(ATUAL, _da_tela(100, 1000, 0.2858), TETO) is None
+
+
+def test_cena_escura_troca_so_o_brilho():
+    assert session_fita._proxima_cor(ATUAL, _da_tela(100, 1000, 0.0), TETO) == session_fita.Cor(
+        100, 1000, 400
+    )
+
+
+def test_cena_sem_cor_mexe_so_no_brilho():
+    escura = Amostra("sem_cor", None, 0.0)
+    clara = Amostra("sem_cor", None, 1.0)
+    assert session_fita._proxima_cor(ATUAL, escura, TETO) == session_fita.Cor(100, 1000, 400)
+    assert session_fita._proxima_cor(ATUAL, clara, TETO) is None
+
+
+
+def _decidir_com(relogio, *pedidas, teto=1000):
+    return [session_fita._decidir(pedida, teto) for pedida in pedidas]
+
+
+AZUL = session_fita.Cor(200, 1000, 1000)
+VERMELHO = session_fita.Cor(10, 1000, 1000)
+
+
+def test_troca_so_com_a_segunda_amostra_concordando(relogio):
+    assert _decidir_com(relogio, AZUL, AZUL._replace(matiz=205)) == [None, AZUL._replace(matiz=205)]
+
+
+def test_amostra_que_discorda_vira_a_nova_candidata(relogio):
+    assert _decidir_com(relogio, AZUL, VERMELHO, VERMELHO) == [None, None, VERMELHO]
+
+
+def test_amostra_sem_troca_descarta_a_candidata(relogio):
+    assert _decidir_com(relogio, AZUL, None, AZUL) == [None, None, None]
+
+
+def test_troca_espera_o_intervalo_minimo(relogio):
+    assert _decidir_com(relogio, AZUL, AZUL) == [None, AZUL]
+    relogio["t"] += 10
+    assert _decidir_com(relogio, VERMELHO, VERMELHO) == [None, None]
+    relogio["t"] += 6  # 16 s depois da troca: passou dos 15
+    assert _decidir_com(relogio, VERMELHO) == [VERMELHO]
+
+
+@pytest.fixture
+def na_tela(fora_de_sessao, monkeypatch, schema, tmp_path):
+    """Uma sessão com o acompanhamento ligado e a tela trocada por uma fila de
+    amostras. Esgotada a fila, o interruptor desliga e o laço sai."""
+    schema.set_boolean("fita-acompanha-tela", True)
+    monkeypatch.setattr(session_fita, "INTERVALO_DA_TELA", 0)
+    monkeypatch.setattr(session_fita, "FADE_DA_TELA", 0)
+    fila = []
+    chamadas = {"n": 0}
+
+    def cor_da_tela():
+        chamadas["n"] += 1
+        if not fila:
+            schema.set_boolean("fita-acompanha-tela", False)
+            return Amostra("ignorada")
+        return fila.pop(0)
+
+    monkeypatch.setattr(session_fita.tela_do_jogo, "cor_da_tela", cor_da_tela)
+    jogo = _jogo(tmp_path)  # capa vermelha: matiz ~0
+    return SimpleNamespace(
+        modulo=fora_de_sessao.modulo,
+        tarefas=fora_de_sessao.tarefas,
+        jogo=jogo,
+        fila=fila,
+        chamadas=chamadas,
+    )
+
+
+def _comecar_com_tela(na_tela):
+    """Começa a sessão e veste a cor do jogo; devolve a tarefa do acompanhamento."""
+    session_fita.comecar(na_tela.jogo)
+    assert len(na_tela.tarefas) == 2
+    na_tela.tarefas.pop(0)()  # veste a cor do jogo
+    acompanhar = na_tela.tarefas.pop(0)
+    # Abrir a conexão agendou o batimento: ele não pode rodar aqui.
+    na_tela.tarefas.clear()
+    na_tela.modulo.recebidos.clear()
+    return acompanhar
+
+
+def _na_fita(cor):
+    return session_fita.hsv_hex(session_fita.na_fita(cor, session_fita.fitas()[0]))
+
+
+def _verde():
+    return session_fita.Cor(
+        130, session_fita._saturacao_da_luz(900), session_fita.brilho_padrao()
+    )
+
+
+def test_sem_o_interruptor_nao_acompanha(na_tela, schema):
+    schema.set_boolean("fita-acompanha-tela", False)
+    session_fita.comecar(na_tela.jogo)
+    assert len(na_tela.tarefas) == 1
+
+
+def test_jogo_com_cor_manual_nao_acompanha(na_tela):
+    session_fita.salvar_cor(na_tela.jogo.game_id, "Jogo", session_fita.Cor(200, 900, 300))
+    session_fita.comecar(na_tela.jogo)
+    assert len(na_tela.tarefas) == 1
+
+
+def test_cor_nova_da_tela_desliza_ate_ela(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend([Amostra("cor", (130, 900))] * 2)  # confirmada
+    acompanhar()
+    assert cor_mandada(na_tela.modulo) == _na_fita(_verde())
+    assert session_fita._cor_ambiente == _verde()
+
+
+def test_cor_parecida_nao_muda_a_luz(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    matiz, saturacao, _ = session_fita.cor_do_jogo(na_tela.jogo)
+    na_tela.fila.append(Amostra("cor", ((matiz + 10) % 360, saturacao)))
+    acompanhar()
+    assert na_tela.modulo.recebidos == []
+
+
+def test_sem_cor_e_ignorada_mantem_a_luz(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend([Amostra("sem_cor"), Amostra("ignorada")])
+    acompanhar()
+    assert na_tela.modulo.recebidos == []
+
+
+
+def test_cada_amostra_vai_para_o_log(na_tela, caplog):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend(
+        [Amostra("cor", (130, 900), 0.5, 37)] * 2 + [Amostra("sem_cor", None, 0.5, 41)]
+    )
+    with caplog.at_level("INFO"):
+        acompanhar()
+    linhas = [r.getMessage() for r in caplog.records if "Tela:" in r.getMessage()]
+    assert len(linhas) == 3
+    assert "37 ms" in linhas[0] and "luz" in linhas[0] and "candidata" in linhas[0]
+    assert "trocou" in linhas[1]
+    assert "41 ms" in linhas[2] and "manteve" in linhas[2] and "brilho" in linhas[2]
+
+def test_pulso_tocando_pula_a_amostra(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    antes = session_fita._cor_ambiente
+    session_fita._pulsando = True
+    na_tela.fila.append(Amostra("cor", (130, 900)))
+    acompanhar()
+    assert na_tela.modulo.recebidos == []
+    assert session_fita._cor_ambiente == antes
+
+
+def test_o_pulso_volta_a_cor_da_tela(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend([Amostra("cor", (130, 900))] * 2)  # confirmada
+    acompanhar()
+    session_fita.pulsar_conquista("normal")
+    na_tela.tarefas.pop(0)()
+    cores = _cores(na_tela.modulo)
+    assert _ouro() in cores
+    assert cores[-1] == _na_fita(_verde())
+
+
+def test_fim_da_sessao_para_o_acompanhamento(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    session_fita.voltar()
+    acompanhar()
+    assert na_tela.chamadas["n"] == 0
+
+
+def test_desligar_o_interruptor_para_o_acompanhamento(na_tela, schema):
+    acompanhar = _comecar_com_tela(na_tela)
+    schema.set_boolean("fita-acompanha-tela", False)
+    acompanhar()
+    assert na_tela.chamadas["n"] == 0
+
+
+def _antes_do_fade(monkeypatch, acao):
+    """Roda ``acao`` depois de a amostra reservar a vez e antes do fade."""
+    deslizar_de_verdade = session_fita._deslizar_da_tela
+    feito = {"n": 0}
+
+    def deslizar(*args):
+        if not feito["n"]:
+            feito["n"] = 1
+            acao()
+        return deslizar_de_verdade(*args)
+
+    monkeypatch.setattr(session_fita, "_deslizar_da_tela", deslizar)
+
+
+def test_fim_da_sessao_vence_o_fade_da_tela(na_tela, monkeypatch):
+    acompanhar = _comecar_com_tela(na_tela)
+
+    def encerrar():
+        session_fita.voltar()
+        na_tela.tarefas.pop()()  # a volta à cor do app roda já
+
+    _antes_do_fade(monkeypatch, encerrar)
+    na_tela.fila.extend([Amostra("cor", (130, 900))] * 2)  # confirmada
+    acompanhar()
+    cores = _cores(na_tela.modulo)
+    assert _na_fita(_verde()) not in cores
+    assert cores[-1] == _na_fita(session_fita.cor_do_app())
+
+
+def test_conquista_vence_o_fade_da_tela(na_tela, monkeypatch):
+    acompanhar = _comecar_com_tela(na_tela)
+
+    def conquistar():
+        session_fita.pulsar_conquista("normal")
+        na_tela.tarefas.pop()()  # o pulso toca já
+
+    _antes_do_fade(monkeypatch, conquistar)
+    na_tela.fila.extend([Amostra("cor", (130, 900))] * 2)  # confirmada
+    acompanhar()
+    cores = _cores(na_tela.modulo)
+    assert _ouro() in cores
+    assert cores[-1] == _na_fita(_verde())
+
+
+def test_sessao_toda_bloqueada_avisa(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend([Amostra("bloqueada"), Amostra("ignorada"), Amostra("bloqueada")])
+    acompanhar()
+    session_fita.voltar()
+    assert session_fita.captura_bloqueada() is True
+    assert session_fita.captura_bloqueada() is False
+
+
+
+def test_uma_so_amostra_preta_nao_avisa(na_tela):
+    """Sessão curta com uma única amostra preta pode ser só a tela de
+    carregamento: não basta para dizer que a captura foi bloqueada."""
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.append(Amostra("bloqueada"))
+    acompanhar()
+    session_fita.voltar()
+    assert session_fita.captura_bloqueada() is False
+
+
+def test_iluminacao_desligada_na_sessao_para_de_acompanhar(na_tela, schema):
+    acompanhar = _comecar_com_tela(na_tela)
+    schema.set_boolean("session-fita", False)
+    na_tela.fila.append(Amostra("cor", (130, 900)))
+    acompanhar()
+    assert na_tela.modulo.recebidos == []
+
+def test_uma_amostra_valida_nao_avisa(na_tela):
+    acompanhar = _comecar_com_tela(na_tela)
+    na_tela.fila.extend([Amostra("bloqueada"), Amostra("sem_cor")])
+    acompanhar()
+    session_fita.voltar()
+    assert session_fita.captura_bloqueada() is False
+
+
+def test_sem_acompanhamento_nao_avisa(na_tela, schema):
+    schema.set_boolean("fita-acompanha-tela", False)
+    session_fita.comecar(na_tela.jogo)
+    session_fita.voltar()
+    assert session_fita.captura_bloqueada() is False
+
+
+# endregion
+
+
+
+# region Cor da tela: interruptor e aviso
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# endregion
+
+
+
+# region Fitas fora do ar na sessão
+
+
+@pytest.fixture
+def relogio(monkeypatch):
+    agora = {"t": 1000.0}
+    monkeypatch.setattr(session_fita, "_agora", lambda: agora["t"])
+    return agora
+
+
+def _suspender(fita_id):
+    fita = next(f for f in session_fita.fitas() if f.id == fita_id)
+    for _ in range(session_fita.FALHAS_PARA_SUSPENDER):
+        session_fita._contar_falha(fita)
+    assert fita_id in session_fita._suspensas
+
+
+def test_comecar_sobe_a_vigia_mesmo_sem_a_tela(pulso, monkeypatch, schema):
+    sessoes = []
+    monkeypatch.setattr(session_fita, "_comecar_vigia", sessoes.append)
+    session_fita.comecar(pulso.jogo)
+    assert sessoes == [session_fita._acompanhamento]
+
+
+def test_fita_suspensa_volta_na_retentativa(pulso, relogio):
+    _suspender("eb0")
+    sessao = session_fita._acompanhamento
+    assert session_fita._retentar_suspensas(sessao) is True
+    assert "eb0" not in session_fita._suspensas
+    cor_do_jogo = session_fita.cor_do_jogo(pulso.jogo)
+    assert cor_mandada(pulso.modulo) == session_fita.hsv_hex(
+        session_fita.na_fita(cor_do_jogo, session_fita.fitas()[0])
+    )
+
+
+def test_fita_que_falha_na_retentativa_volta_a_ser_suspensa(pulso, relogio):
+    _suspender("eb0")
+    pulso.modulo.quebrada = True
+    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    assert "eb0" in session_fita._suspensas
+    assert session_fita._falhas["eb0"] == 1  # uma tentativa só, e não três
+
+
+def test_retentativa_para_no_fim_da_sessao(pulso, relogio):
+    _suspender("eb0")
+    sessao = session_fita._acompanhamento
+    session_fita.voltar()
+    assert session_fita._retentar_suspensas(sessao) is False
+    assert pulso.modulo.recebidos == []
+
+
+def test_vigia_sai_quando_a_sessao_acaba(pulso, monkeypatch):
+    monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
+    sessao = session_fita._acompanhamento
+    session_fita.voltar()
+    session_fita._vigiar_fitas(sessao)  # volta, e não fica em laço
+
+
+def test_fora_do_ar_mais_de_um_minuto_avisa(pulso, relogio):
+    _suspender("eb0")
+    relogio["t"] += 61
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == ["Fita 0"]
+    assert session_fita.fitas_fora_do_ar() == []
+
+
+def test_fora_do_ar_soma_as_vezes_da_sessao(pulso, relogio):
+    _suspender("eb0")
+    relogio["t"] += 40
+    session_fita._retentar_suspensas(session_fita._acompanhamento)  # volta
+    _suspender("eb0")
+    relogio["t"] += 30
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == ["Fita 0"]
+
+
+def test_fora_do_ar_por_pouco_nao_avisa(pulso, relogio):
+    _suspender("eb0")
+    relogio["t"] += 30
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == []
+
+
+def test_iluminacao_desligada_nao_conta_fora_do_ar(pulso, relogio, schema):
+    _suspender("eb0")
+    session_fita.voltar()
+    schema.set_boolean("session-fita", False)
+    session_fita.comecar(pulso.jogo)
+    relogio["t"] += 120
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == []
+
+
+def test_fita_que_o_app_nao_pinta_nao_conta_fora_do_ar(pulso, relogio, schema):
+    # Sem estado de antes guardado, a fita não é pintada na sessão.
+    schema.set_string(session_fita.CHAVE_ESTADO, "")
+    session_fita.comecar(pulso.jogo)
+    _suspender("eb0")
+    relogio["t"] += 120
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == []
+
+
+def test_fita_que_volta_e_ligada(pulso, relogio):
+    """Fita que voltou da tomada pode voltar apagada: a cor sozinha não a
+    acende."""
+    _suspender("eb0")
+    pulso.modulo.dps["20"] = False
+    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    assert estado_mandado(pulso.modulo) is True
+    assert "eb0" not in session_fita._suspensas
+
+
+def test_retentativa_nao_atropela_o_pulso(pulso, relogio):
+    _suspender("eb0")
+    session_fita._pulsando = True
+    assert session_fita._retentar_suspensas(session_fita._acompanhamento) is True
+    assert "eb0" in session_fita._suspensas
+    assert pulso.modulo.recebidos == []
+
+
+def test_tentativa_que_falha_conta_como_fora_do_ar(pulso, relogio, monkeypatch):
+    """A tentativa que falha leva o tempo da espera da fita, e esse tempo
+    também foi fora do ar."""
+    monkeypatch.setattr(session_fita, "FORA_DO_AR_PARA_AVISAR", 22)
+    transitar_de_verdade = session_fita._transitar
+
+    def transitar_demorado(*args):
+        relogio["t"] += 5  # a espera da fita que não responde
+        return transitar_de_verdade(*args)
+
+    monkeypatch.setattr(session_fita, "_transitar", transitar_demorado)
+    _suspender("eb0")
+    pulso.modulo.quebrada = True
+    relogio["t"] += 15
+    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    relogio["t"] += 5
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == ["Fita 0"]  # 25 s, e não 20
+
+
+def test_sessao_nova_comeca_a_conta_do_zero(pulso, relogio):
+    _suspender("eb0")
+    relogio["t"] += 120
+    session_fita.comecar(pulso.jogo)
+    relogio["t"] += 10
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == []
+
+
+# endregion
+
+
+
+# region Edição do jogo: "Automático"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# endregion
+
+
+# region Fade da tela
+
+
+@pytest.fixture
+def fade_da_tela(na_tela, monkeypatch):
+    """A sessão de ``na_tela`` com o fade de verdade, sem dormir."""
+    monkeypatch.setattr(session_fita, "FADE_DA_TELA", 6)
+    monkeypatch.setattr(session_fita.time, "sleep", lambda _segundos: None)
+    return na_tela
+
+
+def _matizes_e_brilhos(modulo):
+    cores = [session_fita.cor_de_hex(c) for c in _cores(modulo)]
+    return [(c.matiz, c.brilho) for c in cores if c is not None]
+
+
+def test_troca_pequena_desliza_direto_a_15_por_segundo(fade_da_tela):
+    acompanhar = _comecar_com_tela(fade_da_tela)  # capa vermelha: matiz 0
+    fade_da_tela.fila.extend([Amostra("cor", (30, 1000))] * 2)
+    acompanhar()
+    passos = _matizes_e_brilhos(fade_da_tela.modulo)
+    assert all(0 <= matiz <= 30 for matiz, _ in passos)
+    assert 80 <= len(passos) <= 95  # 6 s a 15/s, mais o comando final
+    assert min(brilho for _, brilho in passos) > session_fita.BRILHO_MINIMO
+
+
+def test_troca_grande_desliza_direto_sem_apagar(fade_da_tela):
+    """A troca grande pelo escuro (a luz apagando e acendendo atrás do monitor)
+    chamava mais atenção que qualquer cor: ela desliza direto, como a pequena."""
+    acompanhar = _comecar_com_tela(fade_da_tela)  # capa vermelha: matiz 0
+    fade_da_tela.fila.extend([Amostra("cor", (200, 1000))] * 2)
+    acompanhar()
+    passos = _matizes_e_brilhos(fade_da_tela.modulo)
+    assert 80 <= len(passos) <= 95  # um fade de verdade, e não um salto
+    assert min(brilho for _, brilho in passos) > session_fita.BRILHO_MINIMO
+    # Pelo lado curto do círculo: de 0 a 200 descendo por 359, 300, 250...
+    assert all(matiz == 0 or matiz >= 200 for matiz, _ in passos)
+    assert passos[-1][0] == 200
+
+
+def test_fim_da_sessao_no_meio_do_fade_para_a_troca(fade_da_tela):
+    acompanhar = _comecar_com_tela(fade_da_tela)
+    modulo = fade_da_tela.modulo
+    mandar_de_verdade = modulo.set_multiple_values
+    mandados = {"n": 0}
+
+    def mandar(valores, nowait=False):
+        mandados["n"] += 1
+        if mandados["n"] == 10 and session_fita._jogo_da_sessao is not None:
+            session_fita.voltar()
+        return mandar_de_verdade(valores, nowait)
+
+    modulo.set_multiple_values = mandar
+    fade_da_tela.fila.extend([Amostra("cor", (200, 1000))] * 2)
+    acompanhar()
+    assert 200 not in {matiz for matiz, _ in _matizes_e_brilhos(modulo)}
+
+
+# endregion
+
+
+
+# region Brilho por jogo
+
+
+def test_brilho_proprio_nao_e_cor_escolhida(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_brilho(jogo.game_id, jogo.name, 300)
+    assert not session_fita.escolhida(jogo.game_id)
+    assert session_fita.cor_escolhida(jogo.game_id) is None
+    assert session_fita.brilho_escolhido(jogo.game_id) == 300
+    automatica = session_fita.cor_da_capa(jogo.get_cover_path())
+    assert session_fita.cor_do_jogo(jogo) == automatica._replace(brilho=300)
+
+
+def test_brilho_igual_ao_padrao_nao_e_gravado(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_brilho(jogo.game_id, jogo.name, 300)
+    session_fita.salvar_brilho(jogo.game_id, jogo.name, session_fita.brilho_padrao())
+    assert session_fita.brilho_escolhido(jogo.game_id) is None
+    assert not session_fita._sidecar(jogo.game_id).exists()
+
+
+def test_voltar_ao_automatico_mantem_o_brilho(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_cor(jogo.game_id, jogo.name, session_fita.Cor(200, 900, 300))
+    session_fita.redefinir(jogo.game_id)
+    assert not session_fita.escolhida(jogo.game_id)
+    assert session_fita.brilho_escolhido(jogo.game_id) == 300
+
+
+def test_voltar_ao_automatico_com_o_brilho_padrao_apaga_tudo(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    cor = session_fita.Cor(200, 900, session_fita.brilho_padrao())
+    session_fita.salvar_cor(jogo.game_id, jogo.name, cor)
+    session_fita.redefinir(jogo.game_id)
+    assert not session_fita._sidecar(jogo.game_id).exists()
+
+
+def test_brilho_ilegivel_vale_o_padrao(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita._sidecar(jogo.game_id).parent.mkdir(parents=True, exist_ok=True)
+    session_fita._sidecar(jogo.game_id).write_text(
+        '{"name": "Jogo", "brilho": null, "locked": false}', encoding="utf-8"
+    )
+    assert session_fita.brilho_escolhido(jogo.game_id) is None
+    assert session_fita.cor_do_jogo(jogo).brilho == session_fita.brilho_padrao()
+
+
+
+
+
+
+
+
+# endregion
+
+
+# region Revisão da luz calma
+
+
+@pytest.fixture
+def relogio_do_fade(fade_da_tela, monkeypatch):
+    """O fade de verdade num relógio falso: dormir anda o relógio."""
+    agora = {"t": 0.0}
+    monkeypatch.setattr(session_fita.time, "monotonic", lambda: agora["t"])
+    monkeypatch.setattr(
+        session_fita.time, "sleep", lambda s: agora.__setitem__("t", agora["t"] + max(0.0, s))
+    )
+    momentos = []
+    modulo = fade_da_tela.modulo
+    mandar_de_verdade = modulo.set_multiple_values
+
+    def mandar(valores, nowait=False):
+        if "24" in valores:
+            momentos.append(agora["t"])
+        return mandar_de_verdade(valores, nowait)
+
+    modulo.set_multiple_values = mandar
+    fade_da_tela.momentos = momentos
+    return fade_da_tela
+
+
+def test_troca_so_de_matiz_tambem_leva_o_fade_inteiro(relogio_do_fade):
+    """25° de matiz no mesmo brilho dão poucos degraus distintos: o fade tem
+    de durar os 6 s mesmo assim, e não o número de degraus a 15 por segundo."""
+    acompanhar = _comecar_com_tela(relogio_do_fade)  # capa vermelha: matiz 0
+    _matiz, saturacao, _brilho = session_fita.cor_do_jogo(relogio_do_fade.jogo)
+    # A saturação da tela que, reforçada, dá exatamente a do jogo: só a matiz anda.
+    da_tela = 250 + (saturacao - session_fita.SATURACAO_MINIMA_DA_TELA) * 5
+    assert session_fita._saturacao_da_luz(da_tela) == saturacao
+    relogio_do_fade.fila.extend([Amostra("cor", (25, da_tela))] * 2)
+    acompanhar()
+    momentos = relogio_do_fade.momentos
+    assert momentos[-1] - momentos[0] >= session_fita.FADE_DA_TELA - 1
+
+
+
+
+
+
+def test_log_separa_candidata_de_confirmada_esperando(na_tela, caplog, monkeypatch):
+    acompanhar = _comecar_com_tela(na_tela)
+    session_fita._ultima_troca = session_fita._agora()  # acabou de trocar
+    na_tela.fila.extend([Amostra("cor", (130, 900))] * 2)
+    with caplog.at_level("INFO"):
+        acompanhar()
+    linhas = [r.getMessage() for r in caplog.records if "Tela:" in r.getMessage()]
+    assert "candidata" in linhas[0]
+    assert "aguardando o intervalo" in linhas[1]
+
+
+# endregion
+
+
+# region Calibração
+
+
+from kyron.utils import calibracao as calibracao_mod  # noqa: E402
+from tests.apoio_session_fita import _jogo
+
+VERMELHO_PUXADO = calibracao_mod.Calibracao(
+    ((-8, 1.0),) + ((0, 1.0),) * 5, (0, 0)
+)
+
+
+def test_calibracao_vai_e_volta_no_arquivo():
+    dados = calibracao_mod.para_json(VERMELHO_PUXADO)
+    session_fita.gravar_fitas([session_fita.Fita("A", "eb0", "1.2.3.4", "k", calibracao=dados)])
+    assert session_fita.fitas()[0].calibracao == dados
+
+
+def test_calibracao_ilegivel_no_arquivo_vira_nada():
+    shared.fitas_arquivo.write_text(
+        json.dumps({"fitas": [{"nome": "A", "id": "eb0", "ip": "1", "key": "k", "calibracao": "x"}]}),
+        encoding="utf-8",
+    )
+    assert session_fita.fitas()[0].calibracao is None
+
+
+def test_na_fita_aplica_a_calibracao_do_dispositivo():
+    fita = session_fita.Fita(
+        "A", "eb0", "1.2.3.4", "k", calibracao=calibracao_mod.para_json(VERMELHO_PUXADO)
+    )
+    assert session_fita.na_fita(session_fita.Cor(0, 1000, 500), fita) == session_fita.Cor(
+        352, 1000, 500
+    )
+
+
+def test_na_fita_com_calibracao_em_edicao_vence_a_gravada():
+    fita = session_fita.Fita("A", "eb0", "1.2.3.4", "k")
+    assert session_fita.na_fita(
+        session_fita.Cor(0, 1000, 500), fita, calibracao=VERMELHO_PUXADO
+    ) == session_fita.Cor(352, 1000, 500)
+
+
+def test_previa_da_calibracao_acende_so_a_escolhida(falsas, monkeypatch, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, False)
+    tarefas = []
+    monkeypatch.setattr(session_fita, "_em_thread", tarefas.append)
+    cor = session_fita.Cor(0, 1000, 500)
+    session_fita.previa_calibracao("eb0", cor, {"eb0": VERMELHO_PUXADO})
+    for tarefa in list(tarefas):  # fora da trava da prévia, como numa thread
+        tarefa()
+    assert session_fita.cor_de_hex(cor_mandada(modulos["eb0"])).matiz == 352
+    assert session_fita.cor_de_hex(cor_mandada(modulos["eb1"])).brilho == session_fita.BRILHO_MINIMO
+
+
+# endregion
+
+
+# region Calibração nas Preferências
+
+
+
+
+
+
+# endregion
+
+
+def test_previa_em_curso_pinta_com_a_calibracao_gravada_depois(falsas, monkeypatch, schema):
+    """A thread da prévia que já estava servindo uma fita usa a fita de quando
+    o pedido chegou, e não a de quando ela começou: senão o Concluir do
+    assistente deixava a fita na cor do app sem a correção nova."""
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False)
+    velha = session_fita.fitas()[0]
+    session_fita.gravar_fitas(
+        [velha._replace(calibracao=calibracao_mod.para_json(VERMELHO_PUXADO))]
+    )
+    session_fita._previa_vivas.add(velha.id)  # uma thread já servindo esta fita
+    try:
+        session_fita.previa(session_fita.Cor(0, 1000, 500))
+        session_fita._servir_previa(velha)
+    finally:
+        session_fita._previa_vivas.discard(velha.id)
+    assert session_fita.cor_de_hex(cor_mandada(modulos["eb0"])).matiz == 352
+
+
+# region Fade direto e pendências da iluminação
+
+
+def test_fade_entre_cores_quase_opostas_passa_por_um_tom_apagado():
+    """Misturadas (e não giradas pela roda), cores quase opostas — azul
+    esverdeado e laranja — se dissolvem por um tom de pouca saturação. (Entre azul puro e vermelho, a mistura das
+    duas luzes é roxa, e o caminho fica igual ao da roda.)"""
+    origem = session_fita.Cor(200, 1000, 1000)
+    destino = session_fita.Cor(10, 1000, 1000)
+    for cor_hex in session_fita._degraus(origem, destino, 60):
+        cor = session_fita.cor_de_hex(cor_hex)
+        longe = min(
+            abs((cor.matiz - 200 + 180) % 360 - 180), abs((cor.matiz - 10 + 180) % 360 - 180)
+        ) > 25
+        if longe:
+            assert cor.saturacao < 600, cor
+
+
+def test_fade_direto_nao_escurece_no_meio():
+    origem = session_fita.Cor(200, 1000, 800)
+    destino = session_fita.Cor(10, 1000, 800)
+    brilhos = [session_fita.cor_de_hex(c).brilho for c in session_fita._degraus(origem, destino, 60)]
+    assert min(brilhos) >= 790
+
+
+def test_fade_entre_tons_vizinhos_continua_entre_eles():
+    origem = session_fita.Cor(0, 1000, 500)
+    destino = session_fita.Cor(30, 1000, 500)
+    for cor_hex in session_fita._degraus(origem, destino, 30):
+        assert 0 <= session_fita.cor_de_hex(cor_hex).matiz <= 30
+
+
+def test_cada_fade_da_fita_vai_para_o_log(fade_da_tela, caplog):
+    acompanhar = _comecar_com_tela(fade_da_tela)
+    fade_da_tela.fila.extend([Amostra("cor", (200, 1000))] * 2)
+    with caplog.at_level("INFO"):
+        acompanhar()
+    linhas = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Fade de")]
+    assert linhas and "Fita 0" in linhas[0]
+    assert "degraus" in linhas[0] and "confirmou" in linhas[0]
+
+
+def test_fade_interrompido_espera_pouco_pela_fita(falsas, monkeypatch, schema):
+    """Um pulso que toma a vez no meio de um fade não espera os até 3 s da
+    confirmação do último degrau — só um instante, para a fita aplicar o que
+    já recebeu antes do comando dele."""
+    modulos = falsas(False)
+    fita = session_fita.fitas()[0]
+    esperas = []
+    monkeypatch.setattr(
+        session_fita, "_alcancou", lambda modulo, valores, prazo=None: esperas.append((valores, prazo)) or True
+    )
+    monkeypatch.setattr(session_fita.time, "sleep", lambda _s: None)
+    vez = session_fita._reservar([fita])[fita.id]
+    mandar_de_verdade = modulos["eb0"].set_multiple_values
+
+    def mandar(valores, nowait=False):
+        session_fita._reservar([fita])  # outra troca toma a vez no meio
+        return mandar_de_verdade(valores, nowait)
+
+    modulos["eb0"].set_multiple_values = mandar
+    caminho = session_fita._degraus(session_fita.Cor(0, 1000, 500), session_fita.Cor(200, 1000, 500), 30)
+    session_fita._rajada(fita, caminho, vez)
+    # Uma espera curta, e não a inteira: sem ela o comando do pulso chegava
+    # antes de a fita aplicar os degraus que já tinha recebido, e falhava.
+    assert len(esperas) == 1
+    assert esperas[0][1] == session_fita.ESPERA_NA_INTERRUPCAO
+
+
+def test_voltar_ao_automatico_com_so_brilho_proprio_mantem_o_brilho(tmp_path, schema):
+    jogo = _jogo(tmp_path)
+    session_fita.salvar_brilho(jogo.game_id, jogo.name, 300)
+    session_fita.redefinir(jogo.game_id)
+    assert session_fita.brilho_escolhido(jogo.game_id) == 300
+
+
+def test_retentativa_atropelada_por_outra_troca_nao_volta_a_suspensao(pulso, relogio, monkeypatch):
+    """Outra troca tomou a vez no meio da nova tentativa: a fita não falhou,
+    e não pode voltar à suspensão por isso."""
+    _suspender("eb0")
+    fita = session_fita.fitas()[0]
+
+    def transitar_atropelado(*_args):
+        session_fita._reservar([fita])
+        return False
+
+    monkeypatch.setattr(session_fita, "_transitar", transitar_atropelado)
+    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    assert "eb0" not in session_fita._suspensas
+
+
+# endregion
+
+
+def test_cor_padrao_e_o_azul_do_kyron():
+    assert session_fita.COR_PADRAO_DO_APP == session_fita.rgb_para_cor(0x15 / 255, 0x8A / 255, 0xFF / 255, 0)[:2] == (210, 918)
+
+
+def test_migra_o_roxo_antigo_gravado(schema):
+    session_fita.salvar_tom_do_app(*session_fita.ROXO_ANTIGO)
+    session_fita.migrar_roxo_antigo()
+    assert session_fita.tom_do_app() == (210, 918)
+
+
+def test_nao_migra_outra_cor(schema):
+    # (285, 622) é o roxo da paleta; só (284, 620), o padrão antigo, migra.
+    for cor in ((285, 622), (30, 500)):
+        session_fita.salvar_tom_do_app(*cor)
+        session_fita.migrar_roxo_antigo()
+        assert session_fita.tom_do_app() == cor
+
+
+def test_sem_nada_gravado_o_padrao_e_azul(schema):
+    assert session_fita.tom_do_app() == (210, 918)

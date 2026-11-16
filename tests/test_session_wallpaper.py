@@ -1,0 +1,355 @@
+# test_session_wallpaper.py
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""O enquadramento e a escada de busca do papel de parede da sessão.
+
+A promessa da tela de escolha é uma só: a miniatura de 146px e o arquivo de
+1080px mostram o MESMO quadro. Ela vale porque as duas passam pela mesma
+``enquadrar``, e é isso que o primeiro grupo de testes prende — se alguém
+"otimizar" um dos dois caminhos para cortar direto em pixels, a grade passa a
+mentir sobre o que vai para o monitor, e nada na tela denuncia isso.
+
+O segundo grupo é a guarda de duas palavras da busca. Cortar o subtítulo
+resgata dez jogos de uma biblioteca de 92, e sem a guarda resgata errado:
+"Aliens: Dark Descent" vira "Aliens" e traz o filme.
+"""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from kyron import shared
+from kyron.utils import session_wallpaper
+
+
+def _arte(largura: int, altura: int) -> Image.Image:
+    """Uma imagem com um quadrante marcado, para o corte ser verificável."""
+    imagem = Image.new("RGB", (largura, altura), (10, 10, 10))
+    for x in range(largura // 4, largura // 2):
+        for y in range(altura // 4, altura // 2):
+            imagem.putpixel((x, y), (255, 0, 0))
+    return imagem
+
+
+def _tamanho(caminho) -> tuple[int, int]:
+    with Image.open(caminho) as imagem:
+        return imagem.size
+
+
+PRINCIPAL = session_wallpaper.Monitor("M1", 0, 0, 1920, 1080)
+DEITADO = session_wallpaper.Monitor("M2", 1920, 0, 2560, 1440)
+EM_PE = session_wallpaper.Monitor("M3", -1080, -476, 1080, 1920)
+
+
+class _AreaComMonitores:
+    """O bastante da IDesktopWallpaper para a preparação da arte."""
+
+    def __init__(self, monitores):
+        self.monitores = monitores
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def em_apresentacao(self):
+        return False
+
+    def ligados(self):
+        return list(self.monitores)
+
+
+@pytest.fixture
+def jogo(make_game):
+    return make_game(game_id="jogo-teste", name="Watch Dogs: Legion")
+
+
+class TestMonitoresAlvo:
+    def test_aplicar_prepara_so_os_alvos_com_o_minimo_e_o_formato_da_grade(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        arte = tmp_path / "arte.jpg"
+        _arte(64, 36).save(arte)
+        monkeypatch.setattr(
+            session_wallpaper,
+            "_AreaDeTrabalho",
+            lambda: _AreaComMonitores([PRINCIPAL, DEITADO, EM_PE]),
+        )
+        pedidos = []
+
+        def fonte(_game, largura, altura, formato):
+            pedidos.append((largura, altura, formato))
+            return arte, session_wallpaper.Posicoes()
+
+        monkeypatch.setattr(session_wallpaper, "_fonte", fonte)
+        vestir = []
+        monkeypatch.setattr(
+            session_wallpaper,
+            "na_thread_principal",
+            lambda _funcao, _sessao, quadros: vestir.append(quadros),
+        )
+
+        session_wallpaper.aplicar(SimpleNamespace(game_id="jogo"), 0)
+
+        assert pedidos == [(2560, 1920, "landscape")]
+        [quadros] = vestir
+        assert [monitor for monitor, _arquivo in quadros] == ["M2", "M3"]
+        assert _tamanho(quadros[0][1]) == (2560, 1440)
+        assert _tamanho(quadros[1][1]) == (1080, 1920)
+
+    def test_cada_monitor_e_cortado_com_a_posicao_da_sua_orientacao(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        arte = tmp_path / "arte.jpg"
+        _arte(64, 36).save(arte)
+        monkeypatch.setattr(
+            session_wallpaper,
+            "_AreaDeTrabalho",
+            lambda: _AreaComMonitores([PRINCIPAL, DEITADO, EM_PE]),
+        )
+        monkeypatch.setattr(
+            session_wallpaper,
+            "_fonte",
+            lambda *_args, **_kwargs: (
+                arte,
+                session_wallpaper.Posicoes(retrato=0.2, paisagem=0.7),
+            ),
+        )
+        monkeypatch.setattr(session_wallpaper, "na_thread_principal", lambda *_args: None)
+        cortes = []
+        original = session_wallpaper.enquadrar
+
+        def enquadrar(imagem, largura, altura, posicao=0.5):
+            cortes.append((largura, altura, posicao))
+            return original(imagem, largura, altura, posicao)
+
+        monkeypatch.setattr(session_wallpaper, "enquadrar", enquadrar)
+
+        session_wallpaper.aplicar(SimpleNamespace(game_id="jogo"), 0)
+
+        assert cortes == [(2560, 1440, 0.7), (1080, 1920, 0.2)]
+
+
+class TestEscolhaPorJogo:
+    def test_sem_sidecar_e_automatico(self, jogo) -> None:
+        assert session_wallpaper.escolha(jogo) == "auto"
+
+    def test_escolha_manual_trava_e_guarda_a_faixa(self, jogo, tmp_path) -> None:
+        origem = tmp_path / "escolhida.jpg"
+        _arte(3840, 2160).save(origem)
+
+        destino = session_wallpaper.salvar_escolha(
+            jogo.game_id, jogo.name, origem, session_wallpaper.Posicoes(0.25, 0.75)
+        )
+        assert destino is not None and destino.is_file()
+        assert session_wallpaper.escolha(jogo) == "manual"
+
+        gravado = json.loads(
+            (shared.wallpapers_dir / f"{jogo.game_id}.json").read_text(encoding="utf-8")
+        )
+        assert gravado["locked"] is True
+        assert gravado["position_portrait"] == 0.25
+        assert gravado["position_landscape"] == 0.75
+
+    def test_posicoes_escolhidas_le_o_sidecar(self, tmp_path) -> None:
+        origem = tmp_path / "escolhida.jpg"
+        _arte(64, 36).save(origem)
+        session_wallpaper.salvar_escolha(
+            "jogo1", "Jogo", origem, session_wallpaper.Posicoes(0.2, 0.8)
+        )
+        posicoes = session_wallpaper.posicoes_escolhidas("jogo1")
+        assert (posicoes.retrato, posicoes.paisagem) == (0.2, 0.8)
+
+    def test_posicoes_escolhidas_sem_sidecar_e_o_padrao(self) -> None:
+        posicoes = session_wallpaper.posicoes_escolhidas("sem-nada")
+        assert (posicoes.retrato, posicoes.paisagem) == (0.5, 0.5)
+
+    def test_renomear_nao_desfaz_a_escolha_manual(self, jogo, tmp_path) -> None:
+        """A busca automática reabre com o nome novo; a escolha à mão, não."""
+        origem = tmp_path / "escolhida.jpg"
+        _arte(3840, 2160).save(origem)
+        session_wallpaper.salvar_escolha(
+            jogo.game_id, jogo.name, origem, session_wallpaper.Posicoes()
+        )
+
+        jogo.name = "Outro nome qualquer"
+        assert session_wallpaper.escolha(jogo) == "manual"
+
+    def test_nao_trocar_e_um_estado_proprio(self, jogo) -> None:
+        session_wallpaper.nao_trocar(jogo.game_id, jogo.name)
+        assert session_wallpaper.escolha(jogo) == "none"
+        assert session_wallpaper.imagem_escolhida(jogo.game_id) is None
+
+    def test_redefinir_volta_ao_automatico(self, jogo, tmp_path) -> None:
+        origem = tmp_path / "escolhida.jpg"
+        _arte(3840, 2160).save(origem)
+        session_wallpaper.salvar_escolha(
+            jogo.game_id, jogo.name, origem, session_wallpaper.Posicoes()
+        )
+
+        session_wallpaper.redefinir(jogo.game_id)
+        assert session_wallpaper.escolha(jogo) == "auto"
+        assert session_wallpaper.imagem_escolhida(jogo.game_id) is None
+
+    def test_arquivo_manual_sumido_volta_ao_automatico(self, jogo, tmp_path) -> None:
+        """Não é "não trocar": é uma escolha que se perdeu, e a busca volta."""
+        origem = tmp_path / "escolhida.jpg"
+        _arte(64, 64).save(origem)
+        destino = session_wallpaper.salvar_escolha(
+            jogo.game_id, jogo.name, origem, session_wallpaper.Posicoes()
+        )
+        assert destino is not None
+        destino.unlink()
+
+        assert session_wallpaper.escolha(jogo) == "auto"
+
+class _AreaFalsa:
+    """O bastante da IDesktopWallpaper para a ida e a volta, sem tocar na tela."""
+
+    def __init__(self, papeis, recusa=()):
+        self.papeis = dict(papeis)
+        self.recusa = set(recusa)
+        self.vestidos: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def papel(self, monitor):
+        return self.papeis.get(monitor)
+
+    def vestir(self, monitor, caminho):
+        if monitor in self.recusa:
+            return False
+        self.vestidos.append((monitor, caminho))
+        self.papeis[monitor] = caminho
+        return True
+
+
+class TestRestauro:
+    def test_restaurar_sem_sessao_nao_faz_nada(self, schema) -> None:
+        schema["session-wallpaper-saved"] = ""
+        session_wallpaper.restaurar()  # não pode levantar nem tocar em COM
+        assert schema.get_string("session-wallpaper-saved") == ""
+
+    def test_a_marca_fica_quando_a_devolucao_falha(self, schema, monkeypatch):
+        """Sem COM na volta, a chave com os originais continua em disco.
+
+        Ela é o único registro do papel de parede de verdade. Apagada, ele se
+        perdia para sempre; mantida, o arranque seguinte tenta de novo, e a
+        sessão seguinte não a sobrescreve (veja o teste dos originais abaixo).
+        """
+        guardado = json.dumps({"M1": "c:/a.jpg"})
+        schema["session-wallpaper-saved"] = guardado
+
+        def sem_com(*_args, **_kwargs):
+            raise OSError("sem área de trabalho neste ambiente")
+
+        monkeypatch.setattr(session_wallpaper, "_AreaDeTrabalho", sem_com)
+        session_wallpaper.restaurar()
+        assert schema.get_string("session-wallpaper-saved") == guardado
+
+    def test_monitor_so_com_a_cor_de_fundo_tambem_volta(self, schema, monkeypatch):
+        """Original vazio quer dizer "sem imagem", e é a esse estado que ele volta."""
+        schema["session-wallpaper-saved"] = json.dumps({"M1": "", "M2": "c:/b.jpg"})
+        area = _AreaFalsa({})
+        monkeypatch.setattr(session_wallpaper, "_AreaDeTrabalho", lambda: area)
+
+        session_wallpaper.restaurar()
+
+        assert sorted(area.vestidos) == [("M1", ""), ("M2", "c:/b.jpg")]
+        assert schema.get_string("session-wallpaper-saved") == ""
+
+    def test_monitor_que_nao_voltou_fica_na_chave(self, schema, monkeypatch):
+        """A volta que falha num monitor só não apaga o original dele.
+
+        O caso de verdade: o papel de parede original mora no iCloud Drive, e
+        sem rede o Windows recusa o arquivo. Apagada a chave, aquele monitor
+        ficava com a arte do jogo e ninguém tentava de novo.
+        """
+        schema["session-wallpaper-saved"] = json.dumps(
+            {"M1": "c:/a.jpg", "M2": "c:/icloud.png"}
+        )
+        area = _AreaFalsa({}, recusa={"M2"})
+        monkeypatch.setattr(session_wallpaper, "_AreaDeTrabalho", lambda: area)
+
+        session_wallpaper.restaurar()
+
+        assert area.vestidos == [("M1", "c:/a.jpg")]
+        assert schema.get_string("session-wallpaper-saved") == json.dumps(
+            {"M2": "c:/icloud.png"}
+        )
+
+    def test_sessao_encerrada_nao_veste(self, schema, monkeypatch, tmp_path):
+        """A arte que fica pronta depois do fim da sessão não vai para a parede."""
+        area = _AreaFalsa({"M1": "c:/original.jpg"})
+        monkeypatch.setattr(session_wallpaper, "_AreaDeTrabalho", lambda: area)
+        quadro = tmp_path / "quadro.jpg"
+        quadro.write_bytes(b"jpg")
+
+        sessao = session_wallpaper._sessao
+        session_wallpaper.restaurar()  # o jogo fechou enquanto a arte baixava
+        session_wallpaper._vestir(sessao, [("M1", quadro)])
+
+        assert area.vestidos == []
+        assert schema.get_string("session-wallpaper-saved") == ""
+        assert not quadro.exists()
+
+    def test_originais_sao_gravados_sem_sobrescrever_os_de_antes(
+        self, schema, monkeypatch, tmp_path
+    ):
+        """Quem já consta na chave fica com o valor de lá; quem falta é lido.
+
+        M1 consta de uma devolução que falhou, e o que ele mostra agora é arte
+        nossa. M3 não responde, e sem original não é vestido.
+        """
+        schema["session-wallpaper-saved"] = json.dumps({"M1": "c:/original.jpg"})
+        area = _AreaFalsa({"M1": "c:/arte-velha.jpg", "M2": "c:/m2.jpg", "M3": None})
+        monkeypatch.setattr(session_wallpaper, "_AreaDeTrabalho", lambda: area)
+        quadros = [(m, tmp_path / f"{m}.jpg") for m in ("M1", "M2", "M3")]
+
+        session_wallpaper._vestir(session_wallpaper._sessao, quadros)
+
+        assert json.loads(schema.get_string("session-wallpaper-saved")) == {
+            "M1": "c:/original.jpg",
+            "M2": "c:/m2.jpg",
+        }
+        assert [monitor for monitor, _ in area.vestidos] == ["M1", "M2"]
+
+
+class TestLimiteDoPapelDeParede:
+    """Papel de parede baixa até 50 MB; a miniatura do seletor, até 25 MB."""
+
+    @staticmethod
+    def _anotar(monkeypatch, modulo):
+        import requests  # noqa: PLC0415
+
+        from kyron.utils.download import MAX_IMAGE_BYTES  # noqa: PLC0415
+
+        limites = []
+
+        def baixar(_url, timeout=10, max_bytes=MAX_IMAGE_BYTES, ao_progredir=None):
+            limites.append(max_bytes)
+            raise requests.RequestException("x")
+
+        monkeypatch.setattr(modulo, "download_bytes", baixar)
+        return limites
+
+    def test_busca_automatica_usa_50_mb(self, monkeypatch) -> None:
+        from kyron.utils.download import MAX_WALLPAPER_BYTES  # noqa: PLC0415
+
+        limites = self._anotar(monkeypatch, session_wallpaper)
+        monkeypatch.setattr(
+            session_wallpaper, "melhor_para", lambda *_a: {"path": "https://x/p.jpg"}
+        )
+        game = SimpleNamespace(game_id="g1", name="Halo", get_cover_path=lambda: None)
+
+        session_wallpaper._fonte(game, 1920, 1080, "deitado")
+
+        assert limites == [MAX_WALLPAPER_BYTES]
