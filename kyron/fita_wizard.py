@@ -31,7 +31,7 @@ from typing import Any, Optional
 import shiboken6
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
-from kyron.utils import open_uri, session_fita, tuya_conta
+from kyron.utils import open_uri, recuperacao_fitas, session_fita, tuya_conta
 from kyron.utils.session_fita import Fita, devolver_removidas, fitas, gravar_fitas
 from kyron.utils.thread_principal import na_thread_principal
 
@@ -111,9 +111,7 @@ def com_enderecos(
 
 def _nuvem(regiao: str, chave: str, segredo: str) -> Any:
     """A fábrica da nuvem da Tuya: o único ponto que fala com ela (os testes trocam este)."""
-    import tinytuya  # noqa: PLC0415
-
-    return tinytuya.Cloud(apiRegion=regiao, apiKey=chave, apiSecret=segredo)
+    return recuperacao_fitas.nuvem(regiao, chave, segredo)
 
 
 def _buscar(eu: "weakref.ref[FitaWizard]", busca: int, chave: str, segredo: str, regiao: str) -> None:
@@ -159,6 +157,7 @@ class FitaWizard(QObject):
         self._marcadas: set[str] = set()
         self._busca = 0
         self._fechado = False
+        session_fita.assistente_abriu()
         self._preencher_credenciais()
 
     def _preencher_credenciais(self) -> None:
@@ -279,6 +278,7 @@ class FitaWizard(QObject):
         if self._fechado:
             return
         self._fechado = True
+        session_fita.assistente_fechou()
         self.fechado.emit()
 
     @Slot()

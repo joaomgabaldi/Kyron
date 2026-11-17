@@ -32,6 +32,7 @@ from typing import Any, NamedTuple, Optional, TYPE_CHECKING
 
 from kyron import shared
 from kyron.utils import calibracao as calibracao_mod
+from kyron.utils import recuperacao_fitas
 from kyron.utils import tela_do_jogo
 from kyron.utils.cor_da_capa import dominante
 from kyron.utils.ler_json import ler_json
@@ -344,8 +345,10 @@ BATIMENTO = 10
 # Falhas seguidas até a fita ser dada como fora do ar (uma pode ser engasgo da rede; três, fita desligada). Suspensa, ela para de custar o ESPERA a cada troca.
 FALHAS_PARA_SUSPENDER = 3
 
-# As conexões abertas por id da fita, com o IP em que foram abertas (um endereço novo invalida a velha).
-_conexoes: dict[str, tuple[str, Any]] = {}
+# As conexões abertas por id da fita, com o (IP, chave, versão) em que foram abertas (um valor novo invalida a velha).
+_conexoes: dict[str, tuple[tuple[str, str, str], Any]] = {}
+# O ``Err`` da última falha de cada fita (``None``: exceção ou erro nosso, sem código). É o que a recuperação lê para saber o que mudou.
+_ultimo_erro: dict[str, Optional[str]] = {}
 _falhas: dict[str, int] = {}
 _suspensas: set[str] = set()
 # Desde quando cada fita suspensa está fora do ar, e quanto ficou na sessão em curso (``fitas_fora_do_ar``).
@@ -375,7 +378,7 @@ def _trava_da(fita: Fita) -> threading.RLock:
 
 
 def _conexao(fita: Fita) -> tuple[Any, bool]:
-    """A conexão aberta desta fita e se ela já existia (abre na primeira vez e quando o IP mudou).
+    """A conexão aberta desta fita e se ela já existia (abre na primeira vez e quando o IP, a chave ou a versão mudou).
 
     Falha numa conexão guardada costuma ser soquete morto em silêncio, e vale abrir outra; numa recém-aberta é a fita que não responde, e insistir só dobraria a espera.
     """
@@ -383,14 +386,15 @@ def _conexao(fita: Fita) -> tuple[Any, bool]:
 
     with _TRAVA_CONEXOES:
         guardada = _conexoes.get(fita.id)
-        if guardada is not None and guardada[0] == fita.ip:
+        dados = (fita.ip, fita.key, fita.versao)
+        if guardada is not None and guardada[0] == dados:
             return guardada[1], True
 
     if guardada is not None:
         _fechar_conexao(guardada[1])
     nova = _dispositivo(fita)
     with _TRAVA_CONEXOES:
-        _conexoes[fita.id] = (fita.ip, nova)
+        _conexoes[fita.id] = (dados, nova)
         if not _batimento_vivo:
             _batimento_vivo = True
             _em_thread(lambda geracao=_geracao: _bater(geracao))
@@ -439,7 +443,7 @@ def _conversar(fita: Fita, acao: Any) -> Optional[Any]:
     """Uma conversa com a fita pela conexão aberta; ``None`` quando falha.
 
     Conexão guardada que falha é descartada e tentada uma vez com conexão nova (roteador reiniciado, PC que voltou da suspensão). Três falhas seguidas
-    suspendem a fita até o "Testar", o fechamento do app ou a próxima abertura.
+    suspendem a fita, e o vigia (``_vigiar_fitas``) a tenta de novo até ela voltar.
     """
     if fita.id in _suspensas:
         return None
@@ -466,23 +470,38 @@ def _conversar(fita: Fita, acao: Any) -> Optional[Any]:
 
         if not falhou:
             _falhas.pop(fita.id, None)
+            _ultimo_erro.pop(fita.id, None)
             return resposta
         if not guardada:
             break
 
     logging.warning("Fita %s não respondeu: %s", fita.nome, resposta.get("Error"))
+    codigo = resposta.get("Err")
+    _ultimo_erro[fita.id] = None if codigo is None else str(codigo)
     _contar_falha(fita)
     return None
 
 
 def _contar_falha(fita: Fita) -> None:
     _falhas[fita.id] = _falhas.get(fita.id, 0) + 1
-    if _falhas[fita.id] >= FALHAS_PARA_SUSPENDER and fita.id not in _suspensas:
+    if _falhas[fita.id] >= FALHAS_PARA_SUSPENDER:
+        _suspender(fita)
+
+
+def _suspender(fita: Fita) -> None:
+    """Tira a fita das conversas e acorda o vigia. Acorda mesmo se ela já estava suspensa: o vigia sai com a iluminação desligada, e o religar passa por aqui."""
+    if fita.id not in _suspensas:
         _suspensas.add(fita.id)
         _suspensa_em[fita.id] = _agora()
         logging.info(
-            "Fita %s suspensa depois de %s falhas seguidas", fita.nome, _falhas[fita.id]
+            "Fita %s suspensa depois de %s falhas seguidas", fita.nome, _falhas.get(fita.id, 0)
         )
+    _acordar_vigia()
+
+
+def _suspensas_configuradas() -> set[str]:
+    """As suspensas que ainda estão na configuração: a removida no assistente segue em ``_suspensas`` e não pode manter vigia nem varredura."""
+    return _suspensas & {fita.id for fita in fitas()}
 
 
 def retomar(ids: Optional[set[str]] = None) -> None:
@@ -824,7 +843,7 @@ def _transitar(
 
 
 
-# A varredura é broadcast e só o assistente a usa, uma vez, para achar o endereço de cada fita (o IP é fixo; se mudar, roda-se o assistente). Doze segundos bastam; o padrão da tinytuya é dezoito.
+# A varredura é broadcast e só o assistente e a recuperação das fitas fora do ar a usam, uma por vez, para achar o endereço e a versão de cada fita. Doze segundos bastam; o padrão da tinytuya é dezoito.
 ESPERA_VARREDURA = 12
 
 # Uma varredura por vez no processo: ela abre um soquete de broadcast numa porta fixa e o Windows não tem `SO_REUSEPORT` (a segunda morre com "apenas uma utilização de cada endereço de soquete").
@@ -851,9 +870,14 @@ def versoes_da_varredura(achados: dict[str, Any]) -> dict[str, str]:
     return mapa
 
 
-def enderecos_na_rede() -> tuple[dict[str, str], dict[str, str]]:
-    """O endereço e a versão do protocolo de cada módulo Tuya que respondeu na rede, em mapas por id. Sem ``poll=True`` (perguntaria o estado de aparelhos que não são nossos). Nunca levanta; sem rede ou biblioteca, dois mapas vazios."""
-    with _TRAVA_VARREDURA:
+def enderecos_na_rede(esperar: bool = True) -> Optional[tuple[dict[str, str], dict[str, str]]]:
+    """O endereço e a versão do protocolo de cada módulo Tuya que respondeu na rede, em mapas por id. Sem ``poll=True`` (perguntaria o estado de aparelhos que não são nossos). Nunca levanta; sem rede ou biblioteca, dois mapas vazios.
+
+    ``esperar=False`` (a recuperação): com a varredura ocupada devolve ``None`` sem varrer, para não enfileirar atrás do assistente.
+    """
+    if not _TRAVA_VARREDURA.acquire(blocking=esperar):
+        return None
+    try:
         try:
             # Dentro do `try`: sem a biblioteca, o `ImportError` derrubaria a thread do assistente e a tela ficaria em "Buscando…" para sempre.
             import tinytuya  # noqa: PLC0415
@@ -863,6 +887,68 @@ def enderecos_na_rede() -> tuple[dict[str, str], dict[str, str]]:
         except Exception as erro:  # a tinytuya levanta de tudo: socket, struct, json
             logging.warning("Varredura das fitas falhou: %s", erro)
             return {}, {}
+    finally:
+        _TRAVA_VARREDURA.release()
+
+
+def atualizar_fita(id_da_fita: str, **campos: str) -> Optional[Fita]:
+    """Troca só estes campos da fita no arquivo e devolve a fita nova (``None`` se ela saiu da lista). Relê o arquivo: brilho e calibração gravados no meio-tempo ficam."""
+    todas = fitas()
+    for indice, fita in enumerate(todas):
+        if fita.id == id_da_fita:
+            todas[indice] = fita._replace(**campos)
+            gravar_fitas(todas)
+            return todas[indice]
+    return None
+
+
+# Com o assistente aberto a recuperação não varre: os dois brigariam pelo soquete de broadcast, e o assistente grava as fitas por conta própria.
+_assistente_aberto = False
+
+
+def assistente_abriu() -> None:
+    global _assistente_aberto  # noqa: PLW0603
+    _assistente_aberto = True
+
+
+def assistente_fechou() -> None:
+    global _assistente_aberto  # noqa: PLW0603
+    _assistente_aberto = False
+
+
+def _recuperar() -> None:
+    """Uma rodada de recuperação das fitas suspensas: acha o que mudou (IP, versão, chave), grava e deixa a retentativa reconectar. Não retoma a fita."""
+    if _assistente_aberto or not _suspensas_configuradas():
+        return
+    achado = enderecos_na_rede(esperar=False)
+    if achado is None:
+        return
+    ips, versoes = achado
+    for fita in fitas():
+        # Reconferido a cada fita: a varredura e a nuvem levam segundos, e o assistente pode ter aberto nesse meio-tempo.
+        if _assistente_aberto:
+            return
+        if fita.id not in _suspensas:
+            continue
+        mudanca = recuperacao_fitas.diagnosticar(fita, _ultimo_erro.get(fita.id), ips, versoes)
+        novos: dict[str, str] = {}
+        if mudanca.ip and mudanca.ip != fita.ip:
+            novos["ip"] = mudanca.ip
+        if mudanca.versao and mudanca.versao != fita.versao:
+            novos["versao"] = mudanca.versao
+        if mudanca.buscar_chave:
+            chave = recuperacao_fitas.chave_da_nuvem(fita)
+            if chave and not _assistente_aberto:
+                novos["key"] = chave
+        # O log vem depois da gravação: a rodada que o assistente interrompe, ou a da fita removida, não gravou nada.
+        if not novos or _assistente_aberto or atualizar_fita(fita.id, **novos) is None:
+            continue
+        if "ip" in novos:
+            logging.info("Fita %s: IP %s → %s", fita.nome, fita.ip, novos["ip"])
+        if "versao" in novos:
+            logging.info("Fita %s: versão do protocolo %s → %s", fita.nome, fita.versao, novos["versao"])
+        if "key" in novos:
+            logging.info("Fita %s: chave atualizada pela nuvem", fita.nome)
 
 CHAVE_ESTADO = "fita-estado-anterior"
 
@@ -1038,13 +1124,29 @@ def _guardar_e_vestir() -> None:
         return
 
     configuradas = fitas()
-    estados = _estados_guardados()
-    novos = _estado_de([fita for fita in configuradas if fita.id not in estados])
-    if novos:
-        estados.update(novos)
-        shared.schema.set_string(CHAVE_ESTADO, json.dumps(estados))
+    _guardar_estado(configuradas)
+    _vestir(cor_do_app(), _guardadas())
+    # Uma falha na abertura já suspende: esperar três deixaria a fita que mudou de IP fora do ar até a terceira troca de cor.
+    for fita in configuradas:
+        # A já suspensa também: a que voltou à suspensão sem falhas (rodada sem cor) ficaria sem vigia depois de desligar e religar.
+        if _falhas.get(fita.id) or fita.id in _suspensas:
+            _suspender(fita)
 
-    _vestir(cor_do_app(), [fita for fita in configuradas if fita.id in estados])
+
+def _guardar_estado(alvos: list[Fita]) -> None:
+    """Lê e grava o estado de antes das fitas que ainda não têm um (chamar com a ``_TRAVA_ARRANQUE``)."""
+    estados = _estados_guardados()
+    novos = _estado_de([fita for fita in alvos if fita.id not in estados])
+    if novos:
+        _juntar_estados(novos)
+
+
+def _juntar_estados(novos: dict[str, Any]) -> None:
+    """Junta à chave os estados lidos sem trocar um já guardado (chamar com a ``_TRAVA_ARRANQUE``): o guardado é o de antes do app, e o lido agora pode já ser a cor do app."""
+    estados = _estados_guardados()
+    for identificador, estado in novos.items():
+        estados.setdefault(identificador, estado)
+    shared.schema.set_string(CHAVE_ESTADO, json.dumps(estados))
 
 
 def _estados_guardados() -> dict[str, Any]:
@@ -1166,6 +1268,7 @@ def comecar(game: "Game") -> None:
     """A sessão começou: veste a cor do jogo (thread de UI). A cor é calculada dentro da thread (tirá-la da capa abre e quantiza uma imagem, o que não pode ocorrer enquanto o jogo abre); a vez de cada fita é tirada aqui, para um "Já terminei" logo depois vencer a cor ainda em cálculo."""
     global _jogo_da_sessao, _teste_do_pulso  # noqa: PLW0603
     alvos = _guardadas() if ligada() else None
+    suspensas = _suspensas_configuradas()
     # A sessão e a vez de cada fita mudam juntas, sob a trava do pulso (um pulso que vê a sessão antiga não reserva depois). Um teste do pulso em curso também acaba: a sessão é dona das fitas.
     global _acompanhamento, _cor_ambiente, _teto_da_sessao, _amostras_validas, _amostras_bloqueadas  # noqa: PLW0603
     global _fitas_da_sessao, _candidata, _ultima_troca  # noqa: PLW0603
@@ -1178,7 +1281,8 @@ def comecar(game: "Game") -> None:
         _acompanhamento = sessao = object()
         # A conta do tempo fora do ar é da sessão: a fita já suspensa começa a contar agora.
         _fora_do_ar.clear()
-        _fitas_da_sessao = {fita.id for fita in alvos} if alvos is not None else set()
+        # A suspensa sem estado (falhou na abertura) também conta: é a que o aviso do fim existe para apontar.
+        _fitas_da_sessao = {fita.id for fita in alvos} | suspensas if alvos is not None else set()
         for identificador in list(_suspensa_em):
             _suspensa_em[identificador] = _agora()
         _cor_ambiente = _teto_da_sessao = _candidata = _ultima_troca = None
@@ -1186,7 +1290,6 @@ def comecar(game: "Game") -> None:
     if alvos is None:
         return
     _em_thread(lambda: _vestir_o_jogo(game, alvos, geracoes, sessao))
-    _comecar_vigia(sessao)
     if acompanha_tela() and not escolhida(game.game_id):
         _em_thread(lambda: _acompanhar(sessao))
 
@@ -1431,50 +1534,116 @@ def captura_bloqueada() -> bool:
 
 
 
-# A cada quantos segundos a fita suspensa é tentada de novo na sessão (a suspensão poupa a espera de uma fita fora da tomada, mas um soluço do Wi-Fi suspendeu uma fita por 40 minutos de jogo). Fora de sessão a suspensão segue.
+# A cada quantos segundos a fita suspensa é tentada de novo, no jogo ou fora dele (a suspensão poupa a espera de uma fita fora da tomada, mas um soluço do Wi-Fi suspendeu uma fita por 40 minutos de jogo). Rodada sim, rodada não, o vigia também procura o que mudou (``_recuperar``).
 RETENTATIVA = 15
 
 FORA_DO_AR_PARA_AVISAR = 60
 
 
-def _comecar_vigia(sessao: object) -> None:
-    _em_thread(lambda: _vigiar_fitas(sessao))
+# Se a thread do vigia está de pé. Escrito sob ``_TRAVA_CONEXOES``: quem suspende e o vigia que sai decidem juntos, e nenhuma suspensão fica sem vigia.
+_vigia_vivo = False
+
+# O app está fechando: o vigia não grava estado nem pinta mais. Escrito sob ``_TRAVA_PULSO`` e nunca desmarcado (o ``fechar`` só vem com o processo saindo).
+_fechando = False
 
 
-def _vigiar_fitas(sessao: object) -> None:
-    while _dormir(RETENTATIVA, lambda: _acompanhamento is sessao):
+def _acordar_vigia() -> None:
+    """Sobe o vigia se não houver um. Chamado de dentro das conversas com as fitas: só segura a trava o bastante para marcar, e a thread é daemon (o fechamento não a espera)."""
+    global _vigia_vivo  # noqa: PLW0603
+    with _TRAVA_CONEXOES:
+        if _vigia_vivo:
+            return
+        _vigia_vivo = True
+    _em_thread(_vigiar_fitas)
+
+
+def _parar_vigia() -> None:
+    global _vigia_vivo  # noqa: PLW0603
+    with _TRAVA_CONEXOES:
+        _vigia_vivo = False
+
+
+def _vigiar_fitas() -> None:
+    """Enquanto houver fita suspensa: a cada ``RETENTATIVA`` tenta de novo e, rodada sim, rodada não, antes procura o IP, a versão e a chave novos. Nunca desiste da fita; sai com a iluminação desligada ou com o app fechando."""
+    try:
+        _rodadas_do_vigia()
+    except Exception:  # pylint: disable=broad-exception-caught
+        # Fora das rodadas (o ``ligada`` lendo o arquivo, por exemplo): sem desmarcar, nenhuma suspensão subiria outro vigia na sessão.
+        logging.warning("O vigia das fitas suspensas parou", exc_info=True)
+        _parar_vigia()
+
+
+def _rodadas_do_vigia() -> None:
+    global _vigia_vivo  # noqa: PLW0603
+    rodada = 0
+    while True:
+        # Lida fora da trava (é o arquivo); só a conferência das suspensas fica dentro.
+        configuradas = {fita.id for fita in fitas()}
+        with _TRAVA_CONEXOES:
+            # Reconferido sob a trava: a suspensão que chega depois daqui vê o vigia morto e sobe outro; a que chegou antes o mantém.
+            if not _suspensas & configuradas:
+                _vigia_vivo = False
+                return
+        if not _dormir(RETENTATIVA, lambda: bool(_suspensas & configuradas)):
+            continue
+        if _fechando or not ligada():
+            _parar_vigia()
+            return
+        rodada += 1
+        if rodada % 2 == 0:
+            try:
+                _recuperar()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logging.warning("Falha ao procurar o que mudou nas fitas suspensas", exc_info=True)
         try:
-            if not _retentar_suspensas(sessao):
+            if not _retentar_suspensas():
+                _parar_vigia()
                 return
         except Exception:  # pylint: disable=broad-exception-caught
             logging.warning("Falha ao tentar de novo as fitas suspensas", exc_info=True)
 
 
-def _retentar_suspensas(sessao: object) -> bool:
-    """Uma rodada: cada fita suspensa volta à cor ambiente, acesa (a que voltou da tomada pode ter voltado apagada). A que não responder volta à suspensão na hora, sem esperar três falhas, senão cada troca esperaria por ela.
-    ``False`` se a sessão acabou ou a iluminação foi desligada. Com pulso tocando, fica para a próxima: a tentativa numa fita muda a seguraria pela espera inteira e o pulso pararia.
+def _retentar_suspensas() -> bool:
+    """Uma rodada: cada fita suspensa volta acesa à cor do momento, a do jogo na sessão e a do app fora dela (a que voltou da tomada pode ter voltado apagada).
+    A que ainda não tem estado de antes (falhou na abertura) o tem lido primeiro: o app só pinta a fita que o fechamento sabe devolver. A que não responder volta à suspensão na hora, sem esperar três falhas, senão cada troca esperaria por ela.
+    ``False`` se a iluminação foi desligada ou o app está fechando. Com pulso tocando, fica para a próxima: a tentativa numa fita muda a seguraria pela espera inteira e o pulso pararia.
     """
-    if not ligada():
+    if _fechando or not ligada():
         return False
-    candidatas = [fita for fita in _guardadas() if fita.id in _suspensas]
+    candidatas = [fita for fita in fitas() if fita.id in _suspensas]
     with _TRAVA_PULSO:
-        if _acompanhamento is not sessao:
-            return False
-        cor = _cor_ambiente
-        if not candidatas or cor is None or _pulsando:
+        if not candidatas or _pulsando:
             return True
-        geracoes = _reservar(candidatas)
     # O relógio é lido antes: o tempo da tentativa que falhar também foi fora do ar.
     inicio = _agora()
     retomar({fita.id for fita in candidatas})
+    # Lido fora da trava: a fita muda segura a leitura pela espera inteira, e o fechamento espera a trava para devolver.
+    lidos = _estado_de([fita for fita in candidatas if fita.id not in _estados_guardados()])
+    if lidos:
+        with _TRAVA_ARRANQUE:
+            # Sob a trava: a devolução do fechamento a toma depois de marcar ``_fechando``, então o que é gravado aqui ainda é devolvido.
+            if _fechando:
+                return False
+            _juntar_estados(lidos)
+    estados = _estados_guardados()
+    do_app = cor_do_app()
+    with _TRAVA_PULSO:
+        # Sob a trava do pulso, como a marca do fechamento: a vez tirada antes dela perde para a da devolução, e depois dela ninguém pinta.
+        if _fechando:
+            return False
+        cor = do_app if _acompanhamento is None else _cor_ambiente
+        # Sem cor ainda (a do jogo em cálculo) ou com um pulso que começou na leitura, ninguém é pintado e todas voltam à suspensão.
+        pintar = [] if cor is None or _pulsando else [fita for fita in candidatas if fita.id in estados]
+        geracoes = _reservar(pintar)
 
     def tentar(fita: Fita) -> None:
-        if _transitar(fita, True, hsv_hex(na_fita(cor, fita)), geracoes[fita.id]):
-            logging.info("Fita %s voltou a responder", fita.nome)
-            return
-        if not _falhas.get(fita.id) and not _vigente(fita, geracoes[fita.id]):
-            # Outra troca tomou a vez e a fita não falhou: fica fora da suspensão (devolvê-la somaria tempo fora do ar que não houve, e daria o aviso falso no fim).
-            return
+        if fita.id in geracoes:
+            if _transitar(fita, True, hsv_hex(na_fita(cor, fita)), geracoes[fita.id]):
+                logging.info("Fita %s voltou a responder", fita.nome)
+                return
+            if not _falhas.get(fita.id) and not _vigente(fita, geracoes[fita.id]):
+                # Outra troca tomou a vez e a fita não falhou: fica fora da suspensão (devolvê-la somaria tempo fora do ar que não houve, e daria o aviso falso no fim).
+                return
         _suspensas.add(fita.id)
         _suspensa_em[fita.id] = inicio
 
@@ -1809,6 +1978,10 @@ def _devolver_no_fechamento() -> None:
 
 def fechar() -> None:
     """O app está fechando: devolve o estado de antes, com hora marcada. Aqui se espera (é a última janela com processo para desfazer), mas não para sempre: estourado o ``PRAZO_FECHAMENTO``, o app sai e o ``restaurar_orfaos`` do próximo arranque termina o serviço."""
+    global _fechando  # noqa: PLW0603
+    # Antes de devolver, e sem esperar o vigia: a rodada em curso vê a marca e para antes de gravar ou pintar.
+    with _TRAVA_PULSO:
+        _fechando = True
     # Antes de devolver: o app fecha sem passar por ``voltar``, e um pulso vivo tiraria uma vez maior que a da devolução e deixaria a fita dourada, com a chave limpa.
     _encerrar_pulsos()
     linha = _em_thread(_devolver_no_fechamento)

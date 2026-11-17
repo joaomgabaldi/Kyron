@@ -708,12 +708,13 @@ def sem_tuya_de_verdade(request, monkeypatch):
     """A nuvem da Tuya e a varredura da rede falham alto. Quem prova o assistente troca `fita_wizard._nuvem` e
     `session_fita.enderecos_na_rede`; quem prova a própria `enderecos_na_rede` leva a marca `varredura_real`."""
     from kyron import fita_wizard  # noqa: PLC0415
-    from kyron.utils import session_fita  # noqa: PLC0415
+    from kyron.utils import recuperacao_fitas, session_fita  # noqa: PLC0415
 
     def proibido(*_args, **_kwargs):
         raise AssertionError("tuya: nenhuma busca na nuvem nem na rede nos testes")
 
     monkeypatch.setattr(fita_wizard, "_nuvem", proibido)
+    monkeypatch.setattr(recuperacao_fitas, "nuvem", proibido)
     if request.node.get_closest_marker("varredura_real") is None:
         monkeypatch.setattr(session_fita, "enderecos_na_rede", proibido)
 
@@ -740,3 +741,11 @@ def app_qt():
 
     coletar_so_na_principal(app)
     yield app
+
+
+@pytest.fixture(autouse=True)
+def assistente_fechado(monkeypatch):
+    """A marca "assistente aberto" é estado de módulo: um `FitaWizard` criado num teste não a deixa passar ao seguinte."""
+    from kyron.utils import session_fita  # noqa: PLC0415
+
+    monkeypatch.setattr(session_fita, "_assistente_aberto", False)

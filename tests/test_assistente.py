@@ -964,3 +964,11 @@ def test_idioma_e_nome_do_jogador_na_etapa_propria(janela, schema):
     assert campo.property("subtitulo") == "Use até 32 caracteres, sem acentos nem símbolos especiais."
     QMetaObject.invokeMethod(linha, "escolhido", Qt.ConnectionType.DirectConnection, Q_ARG(int, 1))
     assert schema.get_string("idioma-do-jogador") == "brazilian"
+
+
+def test_concluir_fecha_o_assistente_das_fitas_aberto(monkeypatch):
+    assistente, _, _ = _assistente()
+    assistente.configurarIluminacao()
+    assert session_fita._assistente_aberto is True
+    assistente.concluir()
+    assert session_fita._assistente_aberto is False

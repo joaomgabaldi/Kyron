@@ -249,6 +249,9 @@ class Assistente(QObject):
         """Uma vez só, em qualquer das três saídas: um login pendente não fica preso a uma janela que sai."""
         self._saindo = True
         self._contas.fechar()
+        # Sem fechar o assistente das fitas, a recuperação delas ficaria desligada pelo resto da sessão.
+        if self._config is not None:
+            self._config.fechar()
 
     @Slot()
     def concluir(self) -> None:

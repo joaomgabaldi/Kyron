@@ -31,6 +31,9 @@ def _esquecer_conexoes():
     session_fita.fechar_conexoes()
     session_fita._falhas.clear()
     session_fita._suspensas.clear()
+    session_fita._ultimo_erro.clear()
+    # O fechamento também: marcado, o vigia dos testes seguintes não faria nada.
+    session_fita._fechando = False
     session_fita._mostrada.clear()
     # O pulso de conquista também.
     session_fita._jogo_da_sessao = None
@@ -52,7 +55,7 @@ def _esquecer_conexoes():
 @pytest.fixture(autouse=True)
 def sem_vigia(monkeypatch):
     """A vigia das fitas fora do ar não sobe sozinha nos testes; os dela chamam uma rodada de cada vez."""
-    monkeypatch.setattr(session_fita, "_comecar_vigia", lambda _sessao: None)
+    monkeypatch.setattr(session_fita, "_acordar_vigia", lambda: None)
 
 
 @pytest.fixture(autouse=True)

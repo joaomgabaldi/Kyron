@@ -88,7 +88,7 @@ def test_b2_ja_terminei_rapido_vence_a_cor_do_jogo(falsas, tmp_path, monkeypatch
 def test_b3_descarte_nao_derruba_a_conexao_que_tomou_o_lugar():
     fita = session_fita.Fita("Centro", "eb0", "1.2.3.4", "k")
     velha, nova = FitaFalsa(), FitaFalsa()
-    session_fita._conexoes[fita.id] = (fita.ip, nova)
+    session_fita._conexoes[fita.id] = ((fita.ip, fita.key, fita.versao), nova)
 
     session_fita._descartar(fita, velha)
 

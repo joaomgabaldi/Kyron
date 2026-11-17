@@ -16,7 +16,7 @@ import pytest
 from PIL import Image
 
 from kyron import shared
-from kyron.utils import session_fita
+from kyron.utils import recuperacao_fitas, session_fita
 from tests.apoio_fita import (  # noqa: F401
     AVISO,
     BATIMENTO,
@@ -2228,6 +2228,10 @@ def relogio(monkeypatch):
     return agora
 
 
+# O de verdade: a fixture ``sem_vigia`` o troca em todos os testes.
+_ACORDAR_VIGIA = session_fita._acordar_vigia
+
+
 def _suspender(fita_id):
     fita = next(f for f in session_fita.fitas() if f.id == fita_id)
     for _ in range(session_fita.FALHAS_PARA_SUSPENDER):
@@ -2235,17 +2239,153 @@ def _suspender(fita_id):
     assert fita_id in session_fita._suspensas
 
 
-def test_comecar_sobe_a_vigia_mesmo_sem_a_tela(pulso, monkeypatch, schema):
-    sessoes = []
-    monkeypatch.setattr(session_fita, "_comecar_vigia", sessoes.append)
-    session_fita.comecar(pulso.jogo)
-    assert sessoes == [session_fita._acompanhamento]
+def test_suspensao_acorda_o_vigia(falsas, monkeypatch):
+    acordadas = []
+    monkeypatch.setattr(session_fita, "_acordar_vigia", lambda: acordadas.append(True))
+    falsas(False)
+    _suspender("eb0")
+    assert acordadas == [True]
+
+
+def test_vigia_sobe_uma_vez_so(monkeypatch):
+    linhas = []
+    monkeypatch.setattr(session_fita, "_em_thread", linhas.append)
+    monkeypatch.setattr(session_fita, "_vigia_vivo", False)
+    _ACORDAR_VIGIA()
+    _ACORDAR_VIGIA()
+    assert len(linhas) == 1
+
+
+def test_falha_ao_abrir_suspende_na_hora(falsas, schema, monkeypatch):
+    schema.set_boolean("session-fita", True)
+    acordadas = []
+    monkeypatch.setattr(session_fita, "_acordar_vigia", lambda: acordadas.append(True))
+    falsas(False, True)
+    session_fita._guardar_e_vestir()
+    assert "eb1" in session_fita._suspensas
+    assert "eb0" not in session_fita._suspensas
+    assert acordadas
+
+
+def test_religar_acorda_o_vigia_da_suspensa_sem_falhas(falsas, schema, monkeypatch):
+    """A rodada sem cor devolve a fita à suspensão com as falhas zeradas; o religar ainda tem de acordar o vigia por ela."""
+    schema.set_boolean("session-fita", True)
+    falsas(False)
+    session_fita._suspensas.add("eb0")
+    acordadas = []
+    monkeypatch.setattr(session_fita, "_acordar_vigia", lambda: acordadas.append(True))
+    session_fita._guardar_e_vestir()
+    assert acordadas
+
+
+def test_fita_sem_estado_volta_fora_do_jogo(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, True)
+    session_fita._guardar_e_vestir()
+    modulos["eb1"].quebrada = False
+    assert session_fita._retentar_suspensas() is True
+    assert "eb1" in json.loads(schema.get_string(session_fita.CHAVE_ESTADO))
+    assert "eb1" not in session_fita._suspensas
+    fita = session_fita.fitas()[1]
+    assert cor_mandada(modulos["eb1"]) == session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.cor_do_app(), fita)
+    )
+
+
+def test_retentativa_fora_do_jogo_usa_a_cor_do_app(fora_de_sessao, relogio):
+    _suspender("eb0")
+    assert session_fita._retentar_suspensas() is True
+    assert "eb0" not in session_fita._suspensas
+    assert cor_mandada(fora_de_sessao.modulo) == session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.cor_do_app(), session_fita.fitas()[0])
+    )
+
+
+def test_vigia_sai_com_a_iluminacao_desligada(falsas, schema, monkeypatch):
+    monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
+    varreduras = []
+    monkeypatch.setattr(session_fita, "_recuperar", lambda: varreduras.append(True))
+    falsas(False)
+    _suspender("eb0")
+    schema.set_boolean("session-fita", False)
+    session_fita._vigiar_fitas()  # volta, e não fica em laço
+    assert varreduras == []
+
+
+def test_vigia_varre_a_cada_segunda_rodada_e_nao_desiste(falsas, schema, monkeypatch):
+    schema.set_boolean("session-fita", True)
+    monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
+    varreduras = []
+
+    def recuperar():
+        varreduras.append(True)
+        raise OSError("disco cheio")  # a rodada que levanta não derruba o vigia
+
+    rodadas = []
+
+    def retentar():
+        rodadas.append(True)
+        if len(rodadas) == 6:
+            session_fita.retomar()
+        return True
+
+    monkeypatch.setattr(session_fita, "_recuperar", recuperar)
+    monkeypatch.setattr(session_fita, "_retentar_suspensas", retentar)
+    falsas(False)
+    _suspender("eb0")
+    session_fita._vigiar_fitas()
+    assert len(rodadas) == 6
+    assert len(varreduras) == 3
+    assert session_fita._vigia_vivo is False
+
+
+def test_fora_do_ar_conta_desde_a_abertura(falsas, schema, relogio, monkeypatch, tmp_path):
+    schema.set_boolean("session-fita", True)
+    monkeypatch.setattr(session_fita, "_em_thread", lambda _tarefa: None)
+    falsas(False, True)
+    # Sem estado guardado, como em toda abertura: o fechamento anterior limpou a chave.
+    session_fita._guardar_e_vestir()
+    session_fita.comecar(_jogo(tmp_path))
+    relogio["t"] += 61
+    session_fita.voltar()
+    assert session_fita.fitas_fora_do_ar() == ["Fita 1"]
+
+
+def _fita_suspensa_removida(falsas):
+    falsas(False, False)
+    _suspender("eb1")
+    session_fita.gravar_fitas(session_fita.fitas()[:1])
+
+
+def test_vigia_sai_com_a_fita_suspensa_removida(falsas, schema, monkeypatch):
+    schema.set_boolean("session-fita", True)
+    monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
+    rodadas = []
+
+    def retentar():
+        rodadas.append(True)
+        session_fita.retomar()  # encerra o laço se ele não tivesse saído sozinho
+        return True
+
+    monkeypatch.setattr(session_fita, "_retentar_suspensas", retentar)
+    _fita_suspensa_removida(falsas)
+    session_fita._vigiar_fitas()  # volta, e não fica em laço
+    assert rodadas == []
+
+
+def test_recuperar_nao_varre_por_fita_removida(falsas, schema, monkeypatch):
+    varreduras = []
+    monkeypatch.setattr(
+        session_fita, "enderecos_na_rede", lambda **_k: varreduras.append(True)
+    )
+    _fita_suspensa_removida(falsas)
+    session_fita._recuperar()
+    assert varreduras == []
 
 
 def test_fita_suspensa_volta_na_retentativa(pulso, relogio):
     _suspender("eb0")
-    sessao = session_fita._acompanhamento
-    assert session_fita._retentar_suspensas(sessao) is True
+    assert session_fita._retentar_suspensas() is True
     assert "eb0" not in session_fita._suspensas
     cor_do_jogo = session_fita.cor_do_jogo(pulso.jogo)
     assert cor_mandada(pulso.modulo) == session_fita.hsv_hex(
@@ -2256,24 +2396,81 @@ def test_fita_suspensa_volta_na_retentativa(pulso, relogio):
 def test_fita_que_falha_na_retentativa_volta_a_ser_suspensa(pulso, relogio):
     _suspender("eb0")
     pulso.modulo.quebrada = True
-    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    session_fita._retentar_suspensas()
     assert "eb0" in session_fita._suspensas
     assert session_fita._falhas["eb0"] == 1  # uma tentativa só, e não três
 
 
-def test_retentativa_para_no_fim_da_sessao(pulso, relogio):
+def test_retentativa_depois_do_jogo_volta_a_cor_do_app(pulso, relogio):
     _suspender("eb0")
-    sessao = session_fita._acompanhamento
     session_fita.voltar()
-    assert session_fita._retentar_suspensas(sessao) is False
-    assert pulso.modulo.recebidos == []
+    pulso.tarefas.clear()  # a volta das outras fitas não interessa aqui
+    assert session_fita._retentar_suspensas() is True
+    assert "eb0" not in session_fita._suspensas
+    assert cor_mandada(pulso.modulo) == session_fita.hsv_hex(
+        session_fita.na_fita(session_fita.cor_do_app(), session_fita.fitas()[0])
+    )
 
 
-def test_vigia_sai_quando_a_sessao_acaba(pulso, monkeypatch):
+def test_vigia_sai_sem_suspensas(monkeypatch):
     monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
-    sessao = session_fita._acompanhamento
-    session_fita.voltar()
-    session_fita._vigiar_fitas(sessao)  # volta, e não fica em laço
+    monkeypatch.setattr(session_fita, "_vigia_vivo", True)
+    session_fita._vigiar_fitas()  # volta, e não fica em laço
+    assert session_fita._vigia_vivo is False
+
+
+def test_vigia_que_levanta_fora_das_rodadas_libera_o_lugar(falsas, monkeypatch):
+    """Sem isso, o vigia morto ficaria marcado como vivo e nenhuma suspensão subiria outro."""
+    monkeypatch.setattr(session_fita, "RETENTATIVA", 0)
+    monkeypatch.setattr(session_fita, "_vigia_vivo", True)
+    falsas(False)
+    _suspender("eb0")
+
+    def ligada():
+        raise OSError("disco cheio")
+
+    monkeypatch.setattr(session_fita, "ligada", ligada)
+    session_fita._vigiar_fitas()
+    assert session_fita._vigia_vivo is False
+
+
+def test_fechamento_nao_espera_a_leitura_do_vigia(falsas, schema, monkeypatch):
+    """A fita que falhou na abertura é lida a cada rodada; muda, a leitura leva a espera inteira, e o fechamento não pode esperar por ela."""
+    schema.set_boolean("session-fita", True)
+    falsas(False, True)
+    session_fita._guardar_e_vestir()
+    assert "eb1" in session_fita._suspensas
+    lendo, solta = threading.Event(), threading.Event()
+
+    def ler_muda(_fita):
+        lendo.set()
+        solta.wait(5)
+
+    monkeypatch.setattr(session_fita, "ler_estado", ler_muda)
+    rodada = threading.Thread(target=session_fita._retentar_suspensas, daemon=True)
+    rodada.start()
+    try:
+        assert lendo.wait(2)
+        assert session_fita._TRAVA_ARRANQUE.acquire(timeout=0.5)
+        session_fita._TRAVA_ARRANQUE.release()
+    finally:
+        solta.set()
+        rodada.join(5)
+
+
+def test_vigia_nao_grava_nem_pinta_depois_do_fechamento(falsas, schema):
+    schema.set_boolean("session-fita", True)
+    modulos = falsas(False, True)
+    session_fita._guardar_e_vestir()
+    session_fita.fechar()
+    # Uma rodada que já estava em curso: a fita volta a responder e ainda está na lista.
+    session_fita._suspensas.add("eb1")
+    modulos["eb1"].quebrada = False
+    modulos["eb1"].recebidos.clear()
+
+    assert session_fita._retentar_suspensas() is False
+    assert schema.get_string(session_fita.CHAVE_ESTADO) == ""
+    assert modulos["eb1"].recebidos == []
 
 
 def test_fora_do_ar_mais_de_um_minuto_avisa(pulso, relogio):
@@ -2287,7 +2484,7 @@ def test_fora_do_ar_mais_de_um_minuto_avisa(pulso, relogio):
 def test_fora_do_ar_soma_as_vezes_da_sessao(pulso, relogio):
     _suspender("eb0")
     relogio["t"] += 40
-    session_fita._retentar_suspensas(session_fita._acompanhamento)  # volta
+    session_fita._retentar_suspensas()  # volta
     _suspender("eb0")
     relogio["t"] += 30
     session_fita.voltar()
@@ -2326,7 +2523,7 @@ def test_fita_que_volta_e_ligada(pulso, relogio):
     acende."""
     _suspender("eb0")
     pulso.modulo.dps["20"] = False
-    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    session_fita._retentar_suspensas()
     assert estado_mandado(pulso.modulo) is True
     assert "eb0" not in session_fita._suspensas
 
@@ -2334,7 +2531,7 @@ def test_fita_que_volta_e_ligada(pulso, relogio):
 def test_retentativa_nao_atropela_o_pulso(pulso, relogio):
     _suspender("eb0")
     session_fita._pulsando = True
-    assert session_fita._retentar_suspensas(session_fita._acompanhamento) is True
+    assert session_fita._retentar_suspensas() is True
     assert "eb0" in session_fita._suspensas
     assert pulso.modulo.recebidos == []
 
@@ -2353,7 +2550,7 @@ def test_tentativa_que_falha_conta_como_fora_do_ar(pulso, relogio, monkeypatch):
     _suspender("eb0")
     pulso.modulo.quebrada = True
     relogio["t"] += 15
-    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    session_fita._retentar_suspensas()
     relogio["t"] += 5
     session_fita.voltar()
     assert session_fita.fitas_fora_do_ar() == ["Fita 0"]  # 25 s, e não 20
@@ -2738,7 +2935,7 @@ def test_retentativa_atropelada_por_outra_troca_nao_volta_a_suspensao(pulso, rel
         return False
 
     monkeypatch.setattr(session_fita, "_transitar", transitar_atropelado)
-    session_fita._retentar_suspensas(session_fita._acompanhamento)
+    session_fita._retentar_suspensas()
     assert "eb0" not in session_fita._suspensas
 
 
@@ -2765,3 +2962,185 @@ def test_nao_migra_outra_cor(schema):
 
 def test_sem_nada_gravado_o_padrao_e_azul(schema):
     assert session_fita.tom_do_app() == (210, 918)
+
+
+# --- Recuperação: grava o que mudou e reconecta ---
+
+
+def _varredura(monkeypatch, ips, versoes=None):
+    monkeypatch.setattr(session_fita, "enderecos_na_rede", lambda esperar=True: (ips, versoes or {}))
+
+
+def _nuvem(monkeypatch, chave):
+    chamadas = []
+    monkeypatch.setattr(recuperacao_fitas, "chave_da_nuvem", lambda fita: chamadas.append(fita.id) or chave)
+    return chamadas
+
+
+def test_conversa_guarda_o_codigo_do_erro(falsas):
+    modulos = falsas(True)
+    fita = session_fita.fitas()[0]
+
+    assert session_fita.ler_estado(fita) is None
+    assert session_fita._ultimo_erro["eb0"] == "905"
+
+    modulos["eb0"].quebrada = False
+    session_fita._suspensas.clear()
+    session_fita._falhas.clear()
+    assert session_fita.ler_estado(fita) is not None
+    assert "eb0" not in session_fita._ultimo_erro
+
+
+def test_recuperar_grava_o_ip_novo_e_loga(falsas, monkeypatch, caplog):
+    falsas(True)
+    _suspender("eb0")
+    _varredura(monkeypatch, {"eb0": "1.2.3.9"})
+    nuvem = _nuvem(monkeypatch, None)
+
+    with caplog.at_level("INFO"):
+        session_fita._recuperar()
+
+    assert session_fita.fitas()[0].ip == "1.2.3.9"
+    assert "Fita Fita 0: IP 1.2.3.4 → 1.2.3.9" in caplog.text
+    assert nuvem == []
+
+
+def test_recuperar_grava_a_versao(falsas, monkeypatch):
+    falsas(True)
+    session_fita.gravar_fitas([session_fita.fitas()[0]._replace(versao="3.4")])
+    _suspender("eb0")
+    session_fita._ultimo_erro["eb0"] = "914"
+    _varredura(monkeypatch, {"eb0": "1.2.3.4"}, {"eb0": "3.5"})
+    nuvem = _nuvem(monkeypatch, None)
+
+    session_fita._recuperar()
+
+    assert session_fita.fitas()[0].versao == "3.5"
+    assert nuvem == []
+
+
+def test_recuperar_grava_a_chave_sem_log_da_chave(falsas, monkeypatch, caplog):
+    falsas(True)
+    session_fita.gravar_fitas([session_fita.fitas()[0]._replace(versao="3.4")])
+    _suspender("eb0")
+    session_fita._ultimo_erro["eb0"] = "914"
+    _varredura(monkeypatch, {"eb0": "1.2.3.4"}, {"eb0": "3.4"})
+    _nuvem(monkeypatch, "nova")
+
+    with caplog.at_level("INFO"):
+        session_fita._recuperar()
+
+    assert session_fita.fitas()[0].key == "nova"
+    assert "chave atualizada pela nuvem" in caplog.text
+    assert "nova" not in caplog.text.replace("chave atualizada pela nuvem", "")
+
+
+def test_recuperar_nao_loga_o_que_nao_gravou(falsas, monkeypatch, caplog):
+    """A fita removida no meio da rodada não é gravada (``atualizar_fita`` devolve ``None``), e o log não pode dizer que foi."""
+    falsas(True)
+    _suspender("eb0")
+    _varredura(monkeypatch, {"eb0": "1.2.3.9"})
+    _nuvem(monkeypatch, None)
+    monkeypatch.setattr(session_fita, "atualizar_fita", lambda *_a, **_k: None)
+
+    with caplog.at_level("INFO"):
+        session_fita._recuperar()
+
+    assert "→" not in caplog.text
+
+
+def test_fita_desligada_nao_mexe_no_arquivo(falsas, monkeypatch):
+    falsas(True)
+    _suspender("eb0")
+    antes = session_fita.shared.fitas_arquivo.read_bytes()
+    _varredura(monkeypatch, {})
+    nuvem = _nuvem(monkeypatch, "nova")
+
+    session_fita._recuperar()
+
+    assert session_fita.shared.fitas_arquivo.read_bytes() == antes
+    assert nuvem == []
+
+
+def test_outro_aparelho_nao_entra(falsas, monkeypatch):
+    falsas(True)
+    _suspender("eb0")
+    antes = session_fita.shared.fitas_arquivo.read_bytes()
+    _varredura(monkeypatch, {"zz9": "1.2.3.9"}, {"zz9": "3.5"})
+    _nuvem(monkeypatch, "nova")
+
+    session_fita._recuperar()
+
+    assert session_fita.shared.fitas_arquivo.read_bytes() == antes
+
+
+def test_atualizar_preserva_brilho_e_calibracao(falsas):
+    falsas(False)
+    fita = session_fita.fitas()[0]
+    session_fita.gravar_fitas([fita._replace(brilho=40, calibracao={"a": 1})])
+
+    nova = session_fita.atualizar_fita("eb0", ip="9.9.9.9")
+
+    assert nova.ip == "9.9.9.9"
+    lida = session_fita.fitas()[0]
+    assert (lida.ip, lida.brilho, lida.calibracao) == ("9.9.9.9", 40, {"a": 1})
+    assert session_fita.atualizar_fita("nao_existe", ip="1.1.1.1") is None
+
+
+def test_assistente_aberto_nao_varre(falsas, monkeypatch):
+    falsas(True)
+    _suspender("eb0")
+    chamadas = []
+    _varredura(monkeypatch, {"eb0": "1.2.3.9"})
+    monkeypatch.setattr(
+        session_fita, "enderecos_na_rede", lambda esperar=True: chamadas.append(1) or ({"eb0": "1.2.3.9"}, {})
+    )
+
+    session_fita.assistente_abriu()
+    session_fita._recuperar()
+    assert chamadas == []
+
+    session_fita.assistente_fechou()
+    session_fita._recuperar()
+    assert chamadas == [1]
+
+
+@pytest.mark.varredura_real
+def test_varredura_ocupada_pula(monkeypatch):
+    chamadas = []
+    falso = ModuleType("tinytuya")
+    falso.deviceScan = lambda *a, **k: chamadas.append(1) or {}
+    monkeypatch.setitem(sys.modules, "tinytuya", falso)
+
+    with session_fita._TRAVA_VARREDURA:
+        assert session_fita.enderecos_na_rede(esperar=False) is None
+    assert chamadas == []
+
+
+def test_conexao_reabre_com_chave_nova(falsas, monkeypatch):
+    modulos = falsas(False)
+    abertas = []
+    monkeypatch.setattr(session_fita, "_dispositivo", lambda f: abertas.append(f.key) or modulos[f.id])
+    fita = session_fita.fitas()[0]
+
+    session_fita.ler_estado(fita)
+    session_fita.ler_estado(session_fita.atualizar_fita("eb0", key="nova"))
+
+    assert abertas == ["k", "nova"]
+
+
+def test_assistente_que_abre_durante_a_varredura_impede_a_gravacao(falsas, monkeypatch):
+    falsas(True)
+    _suspender("eb0")
+    antes = session_fita.shared.fitas_arquivo.read_bytes()
+
+    def varrer(esperar=True):
+        session_fita.assistente_abriu()
+        return {"eb0": "1.2.3.9"}, {}
+
+    monkeypatch.setattr(session_fita, "enderecos_na_rede", varrer)
+    _nuvem(monkeypatch, "nova")
+
+    session_fita._recuperar()
+
+    assert session_fita.shared.fitas_arquivo.read_bytes() == antes
