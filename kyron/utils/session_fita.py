@@ -534,6 +534,7 @@ def _bater(geracao: int) -> None:
             if trava is None or not trava.acquire(blocking=False):
                 continue
             # Uma consulta e não o `heartbeat` da tinytuya: ele não lê a resposta, que sobrava no soquete (`_esvaziar`); a consulta a lê e diz se a fita sumiu.
+            codigo = None
             try:
                 # Reconferido com a trava: a conexão pode ter sido descartada, e usar o objeto fechado faria a tinytuya reabrir um soquete que ninguém fecharia.
                 with _TRAVA_CONEXOES:
@@ -542,11 +543,22 @@ def _bater(geracao: int) -> None:
                 _esvaziar(modulo)
                 resposta = modulo.status()
                 if isinstance(resposta, dict) and resposta.get("Error"):
+                    codigo = resposta.get("Err")
                     raise ConnectionError(resposta["Error"])
-            except Exception:  # a tinytuya levanta de tudo
+            except Exception as erro:  # a tinytuya levanta de tudo
                 with _TRAVA_CONEXOES:
                     _conexoes.pop(identificador, None)
                 _fechar_conexao(modulo)
+                # Como em `_conversar`: o código da tinytuya só vem na resposta de erro; exceção de soquete fica sem código.
+                _ultimo_erro[identificador] = None if codigo is None else str(codigo)
+                # Fora do jogo o batimento é a única conversa com a fita: sem suspendê-la, a que saiu da tomada (ou trocou de IP) nunca
+                # entraria na recuperação e só seria notada no próximo jogo, três esperas depois. No fechamento não: suspensa, a devolução
+                # dela seria pulada por um soluço do Wi-Fi.
+                fita = next((f for f in fitas() if f.id == identificador), None)
+                if fita is not None and not _fechando:
+                    logging.warning("Fita %s não respondeu ao batimento: %s", fita.nome, erro)
+                    _falhas[identificador] = _falhas.get(identificador, 0) + 1
+                    _suspender(fita)
             finally:
                 trava.release()
 

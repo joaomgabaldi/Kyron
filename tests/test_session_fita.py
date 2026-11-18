@@ -881,6 +881,46 @@ def test_batimento_nao_deixa_resposta_por_ler(com_fila, monkeypatch):
     assert modulo.por_ler_ao_fechar == []
 
 
+def test_batimento_que_falha_suspende_e_acorda_o_vigia(falsas, monkeypatch):
+    """Fora do jogo só o batimento fala com a fita: a falha dele é a única notícia de que ela saiu da tomada."""
+    modulo = falsas(False)["eb0"]
+    acordado = []
+    monkeypatch.setattr(session_fita, "_acordar_vigia", lambda: acordado.append(True))
+    monkeypatch.setattr(session_fita, "BATIMENTO", 0.01)
+    fita = session_fita.fitas()[0]
+    assert session_fita.aplicar(fita, True, "015403e80096") is True
+
+    modulo.quebrada = True
+    limite = time.monotonic() + 2
+    # O vigia é acordado por último: esperar por ele garante que o resto já aconteceu.
+    while not acordado and time.monotonic() < limite:
+        time.sleep(0.01)
+
+    assert acordado
+    assert "eb0" in session_fita._suspensas
+    assert "eb0" not in session_fita._conexoes
+    # O código vai para o diagnóstico da recuperação (914 = chave ou versão).
+    assert session_fita._ultimo_erro["eb0"] == "905"
+
+
+def test_batimento_que_falha_no_fechamento_nao_suspende(falsas, monkeypatch):
+    """Suspensa no fechamento, a fita teria a devolução ao estado de antes pulada por um soluço do Wi-Fi."""
+    modulo = falsas(False)["eb0"]
+    monkeypatch.setattr(session_fita, "BATIMENTO", 0.01)
+    assert session_fita.aplicar(session_fita.fitas()[0], True, "015403e80096") is True
+    monkeypatch.setattr(session_fita, "_fechando", True)
+
+    modulo.quebrada = True
+    limite = time.monotonic() + 2
+    # O batimento só para depois de decidir se suspende: esperar por ele, e não pela conexão sumir, que vem antes da decisão.
+    while session_fita._batimento_vivo and time.monotonic() < limite:
+        time.sleep(0.01)
+
+    assert not session_fita._batimento_vivo
+    assert "eb0" not in session_fita._conexoes
+    assert "eb0" not in session_fita._suspensas
+
+
 def test_fechamento_nao_deixa_resposta_por_ler(com_fila, schema):
     """Resposta por ler no fechamento perdia a devolução de uma ou duas fitas."""
     fita, modulo = com_fila
