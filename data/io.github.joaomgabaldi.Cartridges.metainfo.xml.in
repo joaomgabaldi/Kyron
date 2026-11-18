@@ -28,7 +28,7 @@
   </requires>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="2.1.1" date="2026-11-16">
+    <release version="2.1.1" date="2026-11-17">
       <description translate="no">
         <ul>
           <li>Os dispositivos de iluminação agora se reconectam sozinhos quando mudam de endereço na rede ou são pareados de novo.</li>
