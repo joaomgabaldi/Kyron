@@ -49,14 +49,14 @@ PYTHON_SHA256 = "d012f3aa29cf07436dae8aea1fec0fd195c2612a0b059b1f915ae0afb9ad1f6
 
 # Build "essentials" do gyan.dev, um dos indicados em ffmpeg.org para Windows; traz a libwebp que a capa de vídeo usa.
 # O SHA-256 é o publicado ao lado do arquivo, em <FFMPEG_URL>.sha256.
-FFMPEG_VERSAO = "9.0.2"
+FFMPEG_VERSAO = "9.1"
 _FFMPEG_PASTA = f"ffmpeg-{FFMPEG_VERSAO}-essentials_build"
 FFMPEG_URL = f"https://www.gyan.dev/ffmpeg/builds/packages/{_FFMPEG_PASTA}.zip"
-FFMPEG_SHA256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+FFMPEG_SHA256 = "b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd"
 FFMPEG_EXE = f"{_FFMPEG_PASTA}/bin/ffmpeg.exe"
 FFMPEG_LICENCA = f"{_FFMPEG_PASTA}/LICENSE"
 # GPLv3 §6: a fonte correspondente, o commit que a página do build publica para esta versão.
-FFMPEG_FONTE = "https://github.com/FFmpeg/FFmpeg/commit/946fcce07b"
+FFMPEG_FONTE = "https://github.com/FFmpeg/FFmpeg/commit/74e4393595"
 
 LUDUSAVI_VERSAO = "0.31.0"
 _LUDUSAVI = f"ludusavi-v{LUDUSAVI_VERSAO}"
